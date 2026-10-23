@@ -12,7 +12,6 @@ no password, no TLS settings.
 > code and the test suite, and the log and metrics samples below come from a real run.
 > It has **not yet been tried against a real provider** (Gmail, SES, SMTP2GO), and the
 > Docker image has not been published yet. See [Provider notes](#provider-notes).
-> The design is in [`spec.md`](spec.md).
 
 ```
  cron / printer / app          smtp-relay                      real SMTP server
@@ -716,9 +715,6 @@ internal/maillog/    the per-mail summary line and log-injection sanitising
 internal/logging/    zerolog setup, output and rotation
 internal/metrics/    Prometheus metrics and health endpoints
 ```
-
-The design lives in [`spec.md`](spec.md), the technical plan in
-[`tasks/plan.md`](tasks/plan.md) and the task list in [`tasks/todo.md`](tasks/todo.md).
 
 ## License
 
