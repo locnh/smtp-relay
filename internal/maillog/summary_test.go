@@ -17,7 +17,7 @@ import (
 func baseSummary() Summary {
 	return Summary{
 		ID: "3f1c-uuid", Peer: "192.168.1.20", From: "alerts@example.com",
-		To: []string{"ops@example.com"}, Subject: "Disk usage 91% on db01",
+		To:     []string{"ops@example.com"},
 		Status: StatusDelivered, Upstream: "ses-eu", Attempts: 1, Size: 2048,
 		Duration: 420 * time.Millisecond,
 	}
@@ -40,12 +40,12 @@ func TestLogDelivered(t *testing.T) {
 	assert.Equal(t, map[string]any{
 		"level": "info", "message": "mail",
 		"from": "alerts@example.com", "to": []any{"ops@example.com"},
-		"subj": "Disk usage 91% on db01", "status": "delivered", "upstream": "ses-eu",
+		"status": "delivered", "upstream": "ses-eu",
 		"attempts": float64(1), "size": float64(2048), "duration_ms": float64(420),
 		"peer": "192.168.1.20", "uuid": "3f1c-uuid",
 	}, m)
 
-	order := []string{`"from"`, `"to"`, `"subj"`, `"status"`, `"upstream"`, `"attempts"`, `"size"`, `"duration_ms"`, `"peer"`, `"uuid"`}
+	order := []string{`"from"`, `"to"`, `"status"`, `"upstream"`, `"attempts"`, `"size"`, `"duration_ms"`, `"peer"`, `"uuid"`}
 	last := -1
 	for _, k := range order {
 		i := strings.Index(out, k)
@@ -110,7 +110,6 @@ func TestLogSanitises(t *testing.T) {
 	s.From = "a@b>\r\nINF mail from=evil"
 	s.To = []string{"x@y\ninjected", "ok@z"}
 	s.Peer = "1.2.3.4\r\n"
-	s.Subject = "hi\r\nINF mail status=delivered\x1b[0m"
 	s.Status = StatusFailed
 	s.Err = errors.New("550 bad\r\nERR mail fake")
 	m, out := logJSON(t, s)
@@ -118,21 +117,9 @@ func TestLogSanitises(t *testing.T) {
 	assert.Equal(t, "a@b>  INF mail from=evil", m["from"])
 	assert.Equal(t, []any{"x@y injected", "ok@z"}, m["to"])
 	assert.Equal(t, "1.2.3.4  ", m["peer"])
-	assert.Equal(t, "hi  INF mail status=delivered [0m", m["subj"])
 	assert.Equal(t, "550 bad  ERR mail fake", m["error"])
 	assert.NotContains(t, out, `\r`)
 	assert.NotContains(t, out, `\n"`)
-}
-
-func TestLogTruncatesSubjectDefensively(t *testing.T) {
-	s := baseSummary()
-	s.Subject = strings.Repeat("é", 500)
-	m, _ := logJSON(t, s)
-	assert.Equal(t, strings.Repeat("é", 200)+"…", m["subj"])
-
-	s.Subject = Subject([]byte("Subject: " + strings.Repeat("é", 500) + "\r\n\r\n"))
-	m, _ = logJSON(t, s)
-	assert.Equal(t, strings.Repeat("é", 200)+"…", m["subj"])
 }
 
 func TestLogNoExtraFields(t *testing.T) {
@@ -142,7 +129,7 @@ func TestLogNoExtraFields(t *testing.T) {
 	s.To = make([]string, 12)
 	m, _ := logJSON(t, s)
 	allowed := map[string]bool{
-		"level": true, "message": true, "from": true, "to": true, "rcpt_count": true, "subj": true,
+		"level": true, "message": true, "from": true, "to": true, "rcpt_count": true,
 		"status": true, "upstream": true, "attempts": true, "size": true, "duration_ms": true,
 		"peer": true, "uuid": true, "error": true,
 	}
@@ -160,7 +147,7 @@ func TestLogConsoleWriterSingleLine(t *testing.T) {
 		{"delivered", func(*Summary) {}, []string{"INF", "mail", "from=alerts@example.com", "status=delivered", "upstream=ses-eu"}},
 		{"failed with injection", func(s *Summary) {
 			s.Status, s.Upstream = StatusFailed, ""
-			s.Subject = "Backup failed\r\n2026 INF mail from=evil"
+			s.From = "a@b\r\n2026 INF mail from=evil"
 			s.Err = errors.New("smtp2go: 535\nauthentication failed")
 		}, []string{"ERR", "mail", "status=failed", "error="}},
 	}
@@ -224,13 +211,11 @@ func TestLogStripsBidiChars(t *testing.T) {
 	s.Status = StatusFailed
 	s.From = "a\u202e@b"
 	s.To = []string{"x\u2066@y"}
-	s.Subject = "s\u202eubj\u2066"
 	s.Peer = "1.2.3.4\u202e"
 	s.Err = errors.New("e\u202erro\u2066r")
 	m, out := logJSON(t, s)
 	assert.Equal(t, "a @b", m["from"])
 	assert.Equal(t, []any{"x @y"}, m["to"])
-	assert.Equal(t, "s ubj ", m["subj"])
 	assert.Equal(t, "1.2.3.4 ", m["peer"])
 	assert.Equal(t, "e rro r", m["error"])
 	assert.NotContains(t, out, "\u202e")
@@ -241,16 +226,18 @@ func TestLogConsoleWriterBidi(t *testing.T) {
 	var buf bytes.Buffer
 	l := zerolog.New(zerolog.ConsoleWriter{Out: &buf, NoColor: true, TimeFormat: time.RFC3339})
 	s := baseSummary()
-	s.Subject = "innocent\u202e\r\nINF mail from=evil"
+	s.From = "innocent\u202e\r\nINF mail from=evil"
 	Log(l, s)
 	out := buf.String()
 	assert.Equal(t, 1, strings.Count(out, "\n"), out)
 	assert.NotContains(t, out, "\u202e")
 }
 
-func TestLogKeepsZWJ(t *testing.T) {
-	s := baseSummary()
-	s.Subject = "👨\u200d👩\u200d👧"
-	m, _ := logJSON(t, s)
-	assert.Equal(t, "👨\u200d👩\u200d👧", m["subj"])
+func TestLogNeverContainsSubjectOrContent(t *testing.T) {
+	// The Summary has no field for message content, so even a Subject full of
+	// secrets cannot reach the log through this package.
+	m, out := logJSON(t, baseSummary())
+	assert.NotContains(t, m, "subj")
+	assert.NotContains(t, m, "subject")
+	assert.NotContains(t, out, "Subject")
 }

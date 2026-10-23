@@ -15,13 +15,13 @@ import (
 )
 
 // logFileMode keeps log files readable by the owner and group only, because
-// they can contain mail Subjects.
+// they contain recipient and sender addresses.
 const logFileMode os.FileMode = 0o640
 
 // textFieldsOrder lists the per-mail summary fields (spec 7.2) in the order
 // they should appear in text output.
 var textFieldsOrder = []string{
-	"from", "to", "rcpt_count", "subj", "status", "upstream",
+	"from", "to", "rcpt_count", "status", "upstream",
 	"attempts", "size", "duration_ms", "peer", "uuid", "error",
 }
 

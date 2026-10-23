@@ -1,3 +1,7 @@
+// Package maillog builds the per-mail summary log line (spec 7.2).
+//
+// The summary never contains message content: no body and no headers, in
+// particular not the Subject, which commonly carries one-time codes.
 package maillog
 
 import (
@@ -24,7 +28,6 @@ type Summary struct {
 	Peer     string
 	From     string
 	To       []string
-	Subject  string
 	Status   Status
 	Upstream string
 	Attempts int
@@ -59,8 +62,7 @@ func Log(l zerolog.Logger, s Summary) {
 	if len(s.To) > maxRecipients {
 		ev = ev.Int("rcpt_count", len(s.To))
 	}
-	ev = ev.Str("subj", truncate(Sanitize(s.Subject), maxSubjectLen)).
-		Str("status", string(status))
+	ev = ev.Str("status", string(status))
 	if delivered && s.Upstream != "" {
 		ev = ev.Str("upstream", Sanitize(s.Upstream))
 	}

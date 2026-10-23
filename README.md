@@ -41,7 +41,8 @@ no password, no TLS settings.
 - **Failover** across upstreams, in the order you list them.
 - **Access control** by source network, and by sender address or domain.
 - **Messages are forwarded unchanged**: envelope, headers and body are not modified.
-- One **summary log line per mail** (`from`, `to`, `subj`, `status`), text or JSON.
+- One **summary log line per mail** (`from`, `to`, `status`, ...), text or JSON. Message
+  content, including the `Subject`, is never logged.
 - **Prometheus metrics** and health endpoints, including soft quota usage per upstream.
 - YAML configuration with strict validation and `-check-config`.
 - Secrets from environment variables or files; never logged.
@@ -451,17 +452,18 @@ lines from a local test run (the client ran on the same machine, hence `peer=127
 `ses-eu` was reachable, `smtp2go` was a stand-in server). `text`:
 
 ```
-2026-10-22T18:06:12+02:00 INF mail from=alerts@example.com to=["ops@example.org"] subj="Disk usage 91% on db01" status=delivered upstream=ses-eu attempts=1 size=88 duration_ms=1 peer=127.0.0.1 uuid=39078567-3b9c-44f6-8054-9bd1e3530254
-2026-10-22T18:06:12+02:00 WRN upstream failed upstream=ses-eu uuid=1cd633de-7fbd-4a2d-9f25-892cc1c7996c error="connect: dial tcp 127.0.0.1:2526: connect: connection refused" error_class=connect
-2026-10-22T18:06:12+02:00 WRN upstream failed upstream=smtp2go uuid=1cd633de-7fbd-4a2d-9f25-892cc1c7996c error="smtp_5xx: smtp 550: 5.1.1 no such user" error_class=smtp_5xx
-2026-10-22T18:06:12+02:00 ERR mail from=alerts@example.com to=["user@bad.test"] subj="Backup failed" status=failed attempts=2 size=77 duration_ms=1 peer=127.0.0.1 uuid=1cd633de-7fbd-4a2d-9f25-892cc1c7996c error="smtp_5xx: smtp 550: 5.1.1 no such user"
+2026-10-23T08:58:04+02:00 WRN upstream failed upstream=ses-eu uuid=197a604d-dab5-4370-a471-904e6ce7a15a error="connect: dial tcp 127.0.0.1:25299: connect: connection refused" error_class=connect
+2026-10-23T08:58:04+02:00 INF mail from=alerts@example.com to=["ops@example.org"] status=delivered upstream=smtp2go attempts=2 size=85 duration_ms=13 peer=127.0.0.1 uuid=197a604d-dab5-4370-a471-904e6ce7a15a
+2026-10-23T08:58:04+02:00 WRN upstream failed upstream=ses-eu uuid=7d6ae07c-328c-4435-8c7d-601d31487979 error="connect: dial tcp 127.0.0.1:25299: connect: connection refused" error_class=connect
+2026-10-23T08:58:04+02:00 WRN upstream failed upstream=smtp2go uuid=7d6ae07c-328c-4435-8c7d-601d31487979 error="smtp_5xx: smtp 550: 5.1.1 no such user" error_class=smtp_5xx
+2026-10-23T08:58:04+02:00 ERR mail from=alerts@example.com to=["user@bad.test"] status=failed attempts=2 size=77 duration_ms=2 peer=127.0.0.1 uuid=7d6ae07c-328c-4435-8c7d-601d31487979 error="smtp_5xx: smtp 550: 5.1.1 no such user"
 ```
 
 `json` (one object per line):
 
 ```json
-{"level":"info","from":"alerts@example.com","to":["ops@example.org"],"subj":"Disk usage 91% on db01","status":"delivered","upstream":"ses-eu","attempts":1,"size":88,"duration_ms":2,"peer":"127.0.0.1","uuid":"7c737714-b90c-48ac-a632-0fa6743b60c2","time":"2026-10-22T18:06:15+02:00","message":"mail"}
-{"level":"error","from":"alerts@example.com","to":["user@bad.test"],"subj":"Backup failed","status":"failed","attempts":2,"size":77,"duration_ms":1,"peer":"127.0.0.1","uuid":"16dc0c1d-efc5-4afd-b174-1889f454aac7","error":"smtp_5xx: smtp 550: 5.1.1 no such user","time":"2026-10-22T18:06:15+02:00","message":"mail"}
+{"level":"info","from":"alerts@example.com","to":["ops@example.org"],"status":"delivered","upstream":"smtp2go","attempts":2,"size":85,"duration_ms":14,"peer":"127.0.0.1","uuid":"84088e93-651b-42a8-88fc-d473e9e226cf","time":"2026-10-23T08:58:06+02:00","message":"mail"}
+{"level":"error","from":"alerts@example.com","to":["user@bad.test"],"status":"failed","attempts":2,"size":77,"duration_ms":3,"peer":"127.0.0.1","uuid":"ef6e9f61-5327-4bb8-a62b-c1c5436d2fc4","error":"smtp_5xx: smtp 550: 5.1.1 no such user","time":"2026-10-23T08:58:06+02:00","message":"mail"}
 ```
 
 Fields of the summary line:
@@ -469,7 +471,6 @@ Fields of the summary line:
 | Field | Meaning |
 |---|---|
 | `from`, `to` | Envelope sender and recipients (at most 10 shown; `rcpt_count` carries the total when cut) |
-| `subj` | Decoded `Subject` |
 | `status` | `delivered` (level info) or `failed` (level error) |
 | `upstream` | The upstream that accepted it (only when delivered) |
 | `attempts` | Number of upstreams tried |
@@ -493,12 +494,11 @@ Other lines you will see:
 
 Notes:
 
-- `Subject` is decoded (RFC 2047), stripped of control characters so it cannot forge
-  log lines, and cut at 200 characters. A missing or broken `Subject` is logged as
-  empty and never stops delivery.
-- **Privacy:** `Subject` is the only mail header that is logged, and it can contain
-  sensitive text (one-time codes, customer names). Message bodies and other headers
-  are never logged, and neither are passwords.
+- **Privacy:** no part of the message is logged: not the body and not any header,
+  `Subject` included, because subjects often carry one-time codes or customer names.
+  Only the envelope (`from`, `to`), sizes, timing and the outcome are recorded, and
+  never passwords. Addresses and errors are stripped of control characters so they
+  cannot forge log lines. To trace one mail, search the logs for its `uuid`.
 - The text format has no colours and uses RFC 3339 timestamps.
 
 ## Metrics
@@ -527,7 +527,7 @@ expose it to untrusted networks. If the metrics port is busy the relay refuses t
 | `smtp_relay_build_info` | gauge | `version` | Running version, always 1 |
 
 Go runtime and process metrics are included. Labels come from a small fixed set or from
-your configured names; email addresses, subjects and client IPs are never used as
+your configured names; email addresses, client IPs and message content are never used as
 labels. `listener` is the configured `address` (for example `0.0.0.0:2525`).
 
 A real excerpt from the same test run as the log lines above (counters and gauges only):
@@ -620,7 +620,9 @@ groups:
 - **Sender allow-list:** set `allowed_senders` / `allowed_sender_domains` so a
   compromised or misconfigured device cannot send as arbitrary addresses. The relay
   does not rewrite the sender, so this is also what your provider will see.
-- **Subjects are logged.** Treat the logs as sensitive (see [Logging](#logging)).
+- **Logs hold addresses, not content.** They list sender and recipient addresses and
+  the outcome; message bodies and headers (`Subject` included) are never logged
+  (see [Logging](#logging)).
 - Upstream credentials are never sent unencrypted unless you set `allow_insecure_auth`,
   and certificates are verified unless you set `insecure_skip_verify`.
 
@@ -710,7 +712,7 @@ internal/upstream/   TLS connection, authentication, sending, error classes
 internal/relay/      failover across upstreams
 internal/app/        wiring and lifecycle
 internal/quota/      sliding-window counters and state file
-internal/maillog/    Subject extraction and the per-mail summary line
+internal/maillog/    the per-mail summary line and log-injection sanitising
 internal/logging/    zerolog setup, output and rotation
 internal/metrics/    Prometheus metrics and health endpoints
 ```

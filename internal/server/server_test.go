@@ -297,7 +297,6 @@ func TestHappyPath(t *testing.T) {
 	assert.Equal(t, "127.0.0.1", s.Peer)
 	assert.Equal(t, "alerts@example.com", s.From)
 	assert.Equal(t, []string{"a@x.test", "b@x.test"}, s.To)
-	assert.Equal(t, "Hello there", s.Subject)
 	assert.Equal(t, maillog.StatusDelivered, s.Status)
 	assert.Equal(t, "up1", s.Upstream)
 	assert.Equal(t, 1, s.Attempts)
@@ -1093,7 +1092,6 @@ func TestBDATHappyPath(t *testing.T) {
 	assert.Equal(t, body, string(msgs[0].Data))
 	_, done, _ := h.ev.snapshot()
 	require.Len(t, done, 1)
-	assert.Equal(t, "chunked", done[0].s.Subject)
 	assert.Equal(t, len(body), done[0].s.Size)
 
 	// The session is reusable afterwards.

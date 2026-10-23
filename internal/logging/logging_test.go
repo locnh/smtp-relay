@@ -310,7 +310,6 @@ func TestNewTextFieldsOrder(t *testing.T) {
 		Str("error", "boom").
 		Int("duration_ms", 5).
 		Str("status", "delivered").
-		Str("subj", "hi").
 		Str("from", "a@example.com").
 		Str("to", "b@example.com").
 		Int("rcpt_count", 1).
@@ -321,7 +320,7 @@ func TestNewTextFieldsOrder(t *testing.T) {
 		Msg("mail")
 
 	line := stdout.String()
-	keys := []string{"from=", "to=", "rcpt_count=", "subj=", "status=", "upstream=", "attempts=", "size=", "duration_ms=", "peer=", "uuid=", "error="}
+	keys := []string{"from=", "to=", "rcpt_count=", "status=", "upstream=", "attempts=", "size=", "duration_ms=", "peer=", "uuid=", "error="}
 	last := -1
 	for _, k := range keys {
 		idx := strings.Index(line, k)

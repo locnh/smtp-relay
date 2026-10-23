@@ -207,7 +207,6 @@ func (s *Session) Data(r io.Reader) error {
 		Peer:     msg.Peer,
 		From:     msg.From,
 		To:       msg.To,
-		Subject:  maillog.Subject(data),
 		Status:   status,
 		Upstream: res.Upstream,
 		Attempts: len(res.Attempts),

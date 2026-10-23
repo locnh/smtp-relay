@@ -483,7 +483,7 @@ func TestEndToEndHappyPath(t *testing.T) {
 	s := summaries[0]
 	assert.Equal(t, "alerts@example.com", s["from"])
 	assert.Equal(t, []any{"ops@example.com", "dev@example.com"}, s["to"])
-	assert.Equal(t, "Disk usage 91%", s["subj"])
+	assert.NotContains(t, s, "subj")
 	assert.Equal(t, "delivered", s["status"])
 	assert.Equal(t, "primary", s["upstream"])
 	assert.EqualValues(t, 1, s["attempts"])
@@ -904,4 +904,42 @@ func sendOn(c *smtp.Client, from, to, msg string) error {
 		return err
 	}
 	return w.Close()
+}
+
+// A Subject often carries one-time codes, so nothing derived from it may reach
+// the log, whether the mail was delivered or not.
+func TestSubjectNeverLogged(t *testing.T) {
+	const otp = "Your code is 482913 for Jane Doe"
+	mail := "From: <alerts@example.com>\r\nTo: <ops@example.com>\r\nSubject: " + otp +
+		"\r\nX-Other: hdr-secret\r\n\r\nbody-secret\r\n"
+
+	t.Run("delivered", func(t *testing.T) {
+		up := startFakeUpstream(t, "", "", "")
+		logPath := filepath.Join(t.TempDir(), "logs", "relay.log")
+		h := start(t, cfgSpec{upstreams: []upSpec{{name: "primary", port: up.port()}}, logPath: logPath})
+		require.NoError(t, h.send("alerts@example.com", []string{"ops@example.com"}, mail))
+		require.NoError(t, h.stop())
+		assertNoContentInLog(t, logPath, "delivered", otp)
+	})
+
+	t.Run("failed", func(t *testing.T) {
+		logPath := filepath.Join(t.TempDir(), "logs", "relay.log")
+		h := start(t, cfgSpec{upstreams: []upSpec{{name: "dead", port: closedPort(t)}}, logPath: logPath})
+		require.Error(t, h.send("alerts@example.com", []string{"ops@example.com"}, mail))
+		require.NoError(t, h.stop())
+		assertNoContentInLog(t, logPath, "failed", otp)
+	})
+}
+
+func assertNoContentInLog(t *testing.T, logPath, wantStatus, otp string) {
+	t.Helper()
+	raw, err := os.ReadFile(logPath)
+	require.NoError(t, err)
+	for _, secret := range []string{otp, "482913", "Jane Doe", "hdr-secret", "body-secret"} {
+		assert.NotContains(t, string(raw), secret)
+	}
+	summaries := filterLog(logLines(t, logPath), "mail")
+	require.Len(t, summaries, 1)
+	assert.Equal(t, wantStatus, summaries[0]["status"])
+	assert.NotContains(t, summaries[0], "subj")
 }

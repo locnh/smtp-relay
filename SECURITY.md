@@ -36,7 +36,8 @@ In scope:
   or upstream certificates accepted without `insecure_skip_verify`
 - secrets (passwords, `*_file` contents) appearing in logs, metrics, error messages or
   SMTP replies
-- log injection through mail content (for example a crafted `Subject` or address)
+- log injection through mail content (for example a crafted address or SMTP error text)
+- any part of a message (body or headers, including the `Subject`) appearing in logs or metrics
 - the relay modifying a message beyond the documented line-ending normalisation
 - a crash, hang or unbounded resource use triggered by a remote SMTP client
 - the container image running with more privilege than documented (non-root UID 10001)
