@@ -290,6 +290,13 @@ func (s *Sender) authenticator(c *smtp.Client) (smtp.Auth, error) {
 	return &loginAuth{username: a.Username, password: s.password, allowInsecure: a.AllowInsecureAuth}, nil
 }
 
+// isTLSAlert detects an alert sent by the peer; crypto/tls does not export the
+// alert type, only wraps it in a *net.OpError with Op "remote error".
+func isTLSAlert(err error) bool {
+	var op *net.OpError
+	return errors.As(err, &op) && op.Op == "remote error"
+}
+
 func classify(st stage, err error) *Error {
 	var ue *Error
 	if errors.As(err, &ue) {
@@ -304,14 +311,13 @@ func classify(st stage, err error) *Error {
 	}
 
 	var ne net.Error
-	var alert tls.AlertError
 	var certErr *tls.CertificateVerificationError
 	switch {
 	case errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &ne) && ne.Timeout()):
 		e.Class = ClassTimeout
 	// With TLS 1.3 a rejected client certificate surfaces as an alert on the
 	// first read after the handshake, not as a handshake error.
-	case errors.As(err, &alert) || errors.As(err, &certErr):
+	case isTLSAlert(err) || errors.As(err, &certErr):
 		e.Class = ClassTLS
 	case st == stageDial:
 		e.Class = ClassConnect
