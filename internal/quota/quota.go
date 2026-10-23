@@ -2,6 +2,9 @@ package quota
 
 import (
 	"context"
+	"errors"
+	"math"
+	"math/bits"
 	"sync"
 	"time"
 
@@ -35,6 +38,8 @@ type upstreamCounter struct {
 	limit         int64
 	windowMinutes int64
 	buckets       map[int64]int64 // unix minute -> messages
+	total         int64           // sum of buckets
+	pruned        int64           // newest minute for which old buckets were pruned
 	warned80      bool
 	warned100     bool
 }
@@ -84,44 +89,62 @@ func New(o Options) (*Manager, error) {
 		if wm < 1 {
 			wm = 1
 		}
-		u := &upstreamCounter{name: q.Name, limit: q.Limit, windowMinutes: wm, buckets: map[int64]int64{}}
+		u := &upstreamCounter{name: q.Name, limit: q.Limit, windowMinutes: wm, buckets: map[int64]int64{}, pruned: math.MinInt64}
 		m.order = append(m.order, u)
 		m.byName[q.Name] = u
 	}
 	if len(m.order) == 0 {
 		return m, nil
 	}
-	if err := checkWritable(m.stateFile); err != nil {
+	if m.stateFile == "" {
+		return nil, errors.New("quota: state file is required when upstreams have a quota")
+	}
+	if err := checkWritable(m.stateFile, m.now()); err != nil {
 		return nil, err
 	}
 	m.load()
+	nowMin := m.nowMinute()
 	for _, u := range m.order {
-		used := u.used(m.nowMinute())
-		u.warned80 = overPercent(used, u.limit, warnPercent)
-		u.warned100 = overPercent(used, u.limit, 100)
+		u.advance(nowMin)
+		u.warned80 = overPercent(u.total, u.limit, warnPercent)
+		u.warned100 = overPercent(u.total, u.limit, 100)
 	}
 	return m, nil
 }
 
 func (m *Manager) nowMinute() int64 { return m.now().Unix() / 60 }
 
-// used sums the buckets inside the window and prunes the older ones.
-func (u *upstreamCounter) used(nowMin int64) int64 {
+// add puts n messages into the bucket of the given minute.
+func (u *upstreamCounter) add(minute, n int64) {
+	u.buckets[minute] += n
+	u.total += n
+}
+
+// advance drops buckets that left the window. It only walks the buckets when
+// the current minute moved on, so the per-message cost stays O(1).
+func (u *upstreamCounter) advance(nowMin int64) {
+	if nowMin <= u.pruned {
+		return
+	}
 	cutoff := nowMin - u.windowMinutes
-	var sum int64
 	for minute, n := range u.buckets {
 		if minute <= cutoff {
 			delete(u.buckets, minute)
-			continue
+			u.total -= n
 		}
-		sum += n
 	}
-	return sum
+	u.pruned = nowMin
 }
 
-// overPercent reports used >= pct% of limit without floating point.
-func overPercent(used, limit int64, pct int64) bool {
-	return limit > 0 && used*100 >= limit*pct
+// overPercent reports used >= pct% of limit with a 128-bit comparison so huge
+// values cannot overflow.
+func overPercent(used, limit, pct int64) bool {
+	if limit <= 0 || used < 0 {
+		return false
+	}
+	uh, ul := bits.Mul64(uint64(used), 100)
+	lh, ll := bits.Mul64(uint64(limit), uint64(pct))
+	return uh > lh || (uh == lh && ul >= ll)
 }
 
 // Record counts one delivered message for upstream. Unknown names are ignored.
@@ -133,13 +156,14 @@ func (m *Manager) Record(upstream string) {
 		return
 	}
 	nowMin := m.nowMinute()
-	if !overPercent(u.used(nowMin), u.limit, warnPercent) {
+	u.advance(nowMin)
+	if !overPercent(u.total, u.limit, warnPercent) {
 		u.warned80, u.warned100 = false, false
 	}
-	u.buckets[nowMin]++
+	u.add(nowMin, 1)
 	m.dirty = true
 
-	used := u.used(nowMin)
+	used := u.total
 	if !u.warned80 && overPercent(used, u.limit, warnPercent) {
 		u.warned80 = true
 		m.log.Warn().Str("upstream", u.name).Int64("used", used).Int64("limit", u.limit).
@@ -175,7 +199,8 @@ func (m *Manager) Statuses() []Status {
 }
 
 func (m *Manager) status(u *upstreamCounter) Status {
-	return Status{Upstream: u.name, Used: u.used(m.nowMinute()), Limit: u.limit}
+	u.advance(m.nowMinute())
+	return Status{Upstream: u.name, Used: u.total, Limit: u.limit}
 }
 
 // WriteErrors returns the number of failed state writes so far.
@@ -219,7 +244,7 @@ func (m *Manager) flush() error {
 	nowMin := m.nowMinute()
 	snap := make(map[string]map[int64]int64, len(m.order))
 	for _, u := range m.order {
-		u.used(nowMin)
+		u.advance(nowMin)
 		b := make(map[int64]int64, len(u.buckets))
 		for k, v := range u.buckets {
 			b[k] = v

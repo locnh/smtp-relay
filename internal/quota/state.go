@@ -4,13 +4,22 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
-const stateVersion = 1
+const (
+	stateVersion = 1
+	// maxStateSize bounds what we read: a state file is a few tens of KiB.
+	maxStateSize = 4 << 20
+	// maxBucketCount and the int64 total check below reject absurd counts as corruption.
+	maxBucketCount = 1 << 40
+	staleTempAge   = time.Minute
+)
 
 type stateFile struct {
 	Version   int                      `json:"version"`
@@ -63,13 +72,35 @@ func writeFileAtomic(path string, data []byte) error {
 	return nil
 }
 
-// checkWritable creates the state directory if needed and proves that files
-// can be created in it.
-func checkWritable(path string) error {
+// removeStaleTemps deletes temp and probe files left by crashed runs. Files
+// younger than staleTempAge may belong to a live writer and are kept.
+func removeStaleTemps(path string, now time.Time) {
+	dir, base := filepath.Dir(path), filepath.Base(path)
+	for _, kind := range []string{".tmp-", ".probe-"} {
+		matches, err := filepath.Glob(filepath.Join(dir, escapeGlob(base)+kind+"*"))
+		if err != nil {
+			continue
+		}
+		for _, p := range matches {
+			if fi, err := os.Lstat(p); err == nil && fi.Mode().IsRegular() && now.Sub(fi.ModTime()) > staleTempAge {
+				_ = os.Remove(p)
+			}
+		}
+	}
+}
+
+func escapeGlob(s string) string {
+	return strings.NewReplacer(`\`, `\\`, "*", `\*`, "?", `\?`, "[", `\[`).Replace(s)
+}
+
+// checkWritable creates the state directory if needed, removes stale temp files
+// and proves that files can be created in it.
+func checkWritable(path string, now time.Time) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("quota: create state dir: %w", err)
 	}
+	removeStaleTemps(path, now)
 	f, err := os.CreateTemp(dir, filepath.Base(path)+".probe-*")
 	if err != nil {
 		return fmt.Errorf("quota: state dir not writable: %w", err)
@@ -94,14 +125,19 @@ func parseState(data []byte) (map[string]map[int64]int64, error) {
 	out := make(map[string]map[int64]int64, len(sf.Upstreams))
 	for name, us := range sf.Upstreams {
 		b := make(map[int64]int64, len(us.Buckets))
+		var total int64
 		for k, v := range us.Buckets {
 			minute, err := strconv.ParseInt(k, 10, 64)
 			if err != nil {
 				return nil, fmt.Errorf("upstream %q: bad bucket key %q", name, k)
 			}
-			if v < 0 {
-				return nil, fmt.Errorf("upstream %q: negative count in bucket %q", name, k)
+			if v < 0 || v > maxBucketCount {
+				return nil, fmt.Errorf("upstream %q: invalid count %d in bucket %q", name, v, k)
 			}
+			if total > math.MaxInt64-v {
+				return nil, fmt.Errorf("upstream %q: total count overflows", name)
+			}
+			total += v
 			b[minute] = v
 		}
 		out[name] = b
@@ -128,7 +164,7 @@ func encodeState(now time.Time, buckets map[string]map[int64]int64) ([]byte, err
 // load reads the state file into the manager. It never fails: a missing file
 // is a first run, and an unusable file is set aside so the relay keeps running.
 func (m *Manager) load() {
-	data, err := os.ReadFile(m.stateFile)
+	fi, err := os.Stat(m.stateFile)
 	if errors.Is(err, os.ErrNotExist) {
 		return
 	}
@@ -137,13 +173,19 @@ func (m *Manager) load() {
 		return
 	}
 
-	loaded, err := parseState(data)
-	if err != nil {
-		dst := fmt.Sprintf("%s.corrupt-%d", m.stateFile, m.now().Unix())
-		if rerr := os.Rename(m.stateFile, dst); rerr != nil {
-			m.log.Warn().Err(rerr).Str("file", m.stateFile).Msg("cannot rename corrupt quota state file")
-			dst = ""
+	var loaded map[string]map[int64]int64
+	if fi.Size() > maxStateSize {
+		err = fmt.Errorf("state file too large (%d bytes)", fi.Size())
+	} else {
+		var data []byte
+		if data, err = os.ReadFile(m.stateFile); err != nil {
+			m.log.Warn().Err(err).Str("file", m.stateFile).Msg("cannot read quota state file, starting with empty counters")
+			return
 		}
+		loaded, err = parseState(data)
+	}
+	if err != nil {
+		dst := m.setAsideCorrupt()
 		m.log.Warn().Err(err).Str("file", m.stateFile).Str("renamed_to", dst).
 			Msg("corrupt quota state file, starting with empty counters")
 		return
@@ -160,7 +202,26 @@ func (m *Manager) load() {
 			if minute > nowMin || minute <= nowMin-u.windowMinutes || n == 0 {
 				continue
 			}
-			u.buckets[minute] = n
+			u.add(minute, n)
 		}
 	}
+}
+
+// setAsideCorrupt renames the state file to <file>.corrupt-<unix nanoseconds>,
+// adding a counter if that name is taken, so earlier evidence is never
+// overwritten. It returns the new name, or "" if the rename failed.
+func (m *Manager) setAsideCorrupt() string {
+	base := fmt.Sprintf("%s.corrupt-%d", m.stateFile, m.now().UnixNano())
+	dst := base
+	for i := 1; ; i++ {
+		if _, err := os.Lstat(dst); errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		dst = fmt.Sprintf("%s-%d", base, i)
+	}
+	if err := os.Rename(m.stateFile, dst); err != nil {
+		m.log.Warn().Err(err).Str("file", m.stateFile).Msg("cannot rename corrupt quota state file")
+		return ""
+	}
+	return dst
 }

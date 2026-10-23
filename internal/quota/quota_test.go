@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -250,6 +251,7 @@ func TestCorruptFileRenamed(t *testing.T) {
 		"wrong version": `{"version":2,"upstreams":{}}`,
 		"bad bucket":    `{"version":1,"upstreams":{"ses":{"buckets":{"x":1}}}}`,
 		"negative":      `{"version":1,"upstreams":{"ses":{"buckets":{"1":-1}}}}`,
+		"huge count":    `{"version":1,"upstreams":{"ses":{"buckets":{"1":1099511627777}}}}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			e := newEnv(t, ses(100))
@@ -265,7 +267,7 @@ func TestCorruptFileRenamed(t *testing.T) {
 			moved, err := filepath.Glob(e.file + ".corrupt-*")
 			require.NoError(t, err)
 			require.Len(t, moved, 1)
-			assert.Contains(t, moved[0], fmt.Sprintf(".corrupt-%d", e.clock.Now().Unix()))
+			assert.Contains(t, moved[0], fmt.Sprintf(".corrupt-%d", e.clock.Now().UnixNano()))
 			b, _ := os.ReadFile(moved[0])
 			assert.Equal(t, content, string(b))
 
@@ -436,4 +438,168 @@ func TestConcurrentRecordAndStatuses(t *testing.T) {
 	<-done
 	assert.EqualValues(t, 800, used(t, m, "ses"))
 	assert.EqualValues(t, 800, used(t, e.manager(t), "ses"))
+}
+
+func TestOversizedStateFileIsCorrupt(t *testing.T) {
+	e := newEnv(t, ses(100))
+	require.NoError(t, os.MkdirAll(filepath.Dir(e.file), 0o700))
+	f, err := os.Create(e.file)
+	require.NoError(t, err)
+	require.NoError(t, f.Truncate(maxStateSize+1))
+	require.NoError(t, f.Close())
+
+	m := e.manager(t)
+	assert.EqualValues(t, 0, used(t, m, "ses"))
+	assert.Contains(t, e.logs.String(), "too large")
+	moved, _ := filepath.Glob(e.file + ".corrupt-*")
+	assert.Len(t, moved, 1)
+	_, err = os.Stat(e.file)
+	assert.True(t, os.IsNotExist(err))
+}
+
+func TestHugeCountsDoNotOverflowPercent(t *testing.T) {
+	assert.True(t, overPercent(math.MaxInt64, 1, 80))
+	assert.True(t, overPercent(math.MaxInt64, math.MaxInt64, 100))
+	assert.False(t, overPercent(math.MaxInt64/2, math.MaxInt64, 100))
+	assert.True(t, overPercent(math.MaxInt64/2, math.MaxInt64, 49))
+	assert.False(t, overPercent(5, 0, 80))
+
+	e := newEnv(t, ses(math.MaxInt64))
+	require.NoError(t, os.MkdirAll(filepath.Dir(e.file), 0o700))
+	now := e.clock.Now().Unix() / 60
+	content := fmt.Sprintf(`{"version":1,"upstreams":{"ses":{"buckets":{"%d":1099511627776}}}}`, now)
+	require.NoError(t, os.WriteFile(e.file, []byte(content), 0o600))
+	m := e.manager(t)
+	assert.EqualValues(t, int64(1)<<40, used(t, m, "ses"))
+	m.Record("ses")
+	assert.EqualValues(t, int64(1)<<40+1, used(t, m, "ses"))
+}
+
+func TestNewRequiresStateFile(t *testing.T) {
+	e := newEnv(t, ses(100))
+	e.opts.StateFile = ""
+	_, err := New(e.opts)
+	assert.Error(t, err)
+}
+
+func TestStaleTempFilesRemoved(t *testing.T) {
+	e := newEnv(t, ses(100))
+	dir := filepath.Dir(e.file)
+	require.NoError(t, os.MkdirAll(dir, 0o700))
+	mk := func(name string, age time.Duration) string {
+		p := filepath.Join(dir, name)
+		require.NoError(t, os.WriteFile(p, []byte("x"), 0o600))
+		ts := e.clock.Now().Add(-age)
+		require.NoError(t, os.Chtimes(p, ts, ts))
+		return p
+	}
+	oldTmp := mk("state.json.tmp-111", 2*time.Minute)
+	oldProbe := mk("state.json.probe-222", time.Hour)
+	freshTmp := mk("state.json.tmp-333", 5*time.Second)
+	other := mk("unrelated.tmp-1", time.Hour)
+
+	e.manager(t)
+	for _, p := range []string{oldTmp, oldProbe} {
+		_, err := os.Stat(p)
+		assert.True(t, os.IsNotExist(err), p)
+	}
+	for _, p := range []string{freshTmp, other} {
+		_, err := os.Stat(p)
+		assert.NoError(t, err, p)
+	}
+}
+
+func TestCorruptRenameDoesNotOverwrite(t *testing.T) {
+	e := newEnv(t, ses(100))
+	require.NoError(t, os.MkdirAll(filepath.Dir(e.file), 0o700))
+	for i := 0; i < 3; i++ {
+		require.NoError(t, os.WriteFile(e.file, []byte(fmt.Sprintf("bad%d", i)), 0o600))
+		e.manager(t)
+	}
+	moved, err := filepath.Glob(e.file + ".corrupt-*")
+	require.NoError(t, err)
+	require.Len(t, moved, 3, "same clock reading must not collide")
+	got := map[string]bool{}
+	for _, p := range moved {
+		b, _ := os.ReadFile(p)
+		got[string(b)] = true
+	}
+	assert.Equal(t, map[string]bool{"bad0": true, "bad1": true, "bad2": true}, got)
+}
+
+func TestWindowEdgeInMemory(t *testing.T) {
+	for _, tc := range []struct {
+		after time.Duration
+		want  int64
+	}{{9 * time.Minute, 1}, {10 * time.Minute, 0}, {11 * time.Minute, 0}} {
+		t.Run(tc.after.String(), func(t *testing.T) {
+			e2 := newEnv(t, UpstreamQuota{Name: "ses", Limit: 10, Window: 10 * time.Minute})
+			m2 := e2.manager(t)
+			m2.Record("ses")
+			e2.clock.Advance(tc.after)
+			assert.Equal(t, tc.want, used(t, m2, "ses"))
+			assert.Equal(t, tc.want, sumBuckets(m2.byName["ses"]), "running total matches buckets")
+		})
+	}
+}
+
+func sumBuckets(u *upstreamCounter) int64 {
+	var s int64
+	for _, n := range u.buckets {
+		s += n
+	}
+	return s
+}
+
+func TestRunningTotalMatchesBuckets(t *testing.T) {
+	e := newEnv(t, ses(1000))
+	m := e.manager(t)
+	for i := 0; i < 200; i++ {
+		recordN(m, "ses", i%3)
+		e.clock.Advance(time.Duration(i%7) * time.Minute)
+		u := used(t, m, "ses")
+		assert.Equal(t, sumBuckets(m.byName["ses"]), u)
+	}
+}
+
+func TestTempFileCleanedOnWriteFailure(t *testing.T) {
+	e := newEnv(t, ses(100))
+	m := e.manager(t)
+	require.NoError(t, os.Mkdir(e.file, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(e.file, "keep"), nil, 0o600))
+
+	m.Record("ses")
+	assert.Error(t, m.flush())
+	assert.EqualValues(t, 1, m.WriteErrors())
+	left, err := filepath.Glob(e.file + ".tmp-*")
+	require.NoError(t, err)
+	assert.Empty(t, left)
+}
+
+func TestRecordDuringSlowWriteStaysDirty(t *testing.T) {
+	e := newEnv(t, ses(100))
+	m := e.manager(t)
+	started, release := make(chan struct{}), make(chan struct{})
+	var writes [][]byte
+	m.write = func(p string, d []byte) error {
+		writes = append(writes, d)
+		if len(writes) == 1 {
+			close(started)
+			<-release
+		}
+		return writeFileAtomic(p, d)
+	}
+
+	m.Record("ses")
+	done := make(chan error)
+	go func() { done <- m.flush() }()
+	<-started
+	m.Record("ses")
+	close(release)
+	require.NoError(t, <-done)
+
+	require.NoError(t, m.flush())
+	require.Len(t, writes, 2, "the Record that landed during the write is flushed next")
+	m2 := e.manager(t)
+	assert.EqualValues(t, 2, used(t, m2, "ses"))
 }
