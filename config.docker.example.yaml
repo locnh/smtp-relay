@@ -19,6 +19,7 @@ server:
   # limits:
   #   max_connections: 100
   #   max_message_size: 10240000
+  #   max_line_length: 1048576   # bytes; min 1000
 
 access:
   # IMPORTANT: clients are not authenticated, this list is the only gate.

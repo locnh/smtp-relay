@@ -292,6 +292,7 @@ Rules:
 | `server.limits.max_connections` | `100` | Shared by all listeners; `-1` = unlimited |
 | `server.limits.max_message_size` | `10240000` | Bytes |
 | `server.limits.max_recipients` | `100` | |
+| `server.limits.max_line_length` | `1048576` | Bytes, minimum `1000` (RFC 5321). Longest single line, for commands and for `DATA` lines; a longer line gets `451 4.3.0` and the connection is closed |
 | `access.allowed_networks` | `127.0.0.0/8`, `::1/128` | CIDRs without host bits. An explicit empty list means "everyone" (warning) |
 | `access.allowed_senders` | empty | Exact `MAIL FROM` addresses |
 | `access.allowed_sender_domains` | empty | Exact domain of `MAIL FROM`, no subdomains |
@@ -380,10 +381,10 @@ advertises `PIPELINING`, `8BITMIME`, `ENHANCEDSTATUSCODES`, `CHUNKING`, `SMTPUTF
 applies to it, but a message refused for size through BDAT is not counted in the
 `size_exceeded` metric.
 
-Lines longer than 2000 bytes (the library default) are refused: the client gets
-`451 4.3.0 Error reading message` and the connection is closed. Properly encoded mail
-(base64 and quoted-printable wrap at 76 characters) never gets near that, but a
-hand-made message with one very long line will.
+Lines up to `server.limits.max_line_length` (1 MiB by default) are accepted, so a
+hand-made message with one very long line, an HTML mail or a pasted log still goes
+through. A longer line is refused with `451 4.3.0 Error reading message` and the
+connection is closed.
 
 ### Forwarded unchanged
 
@@ -593,6 +594,11 @@ groups:
   failover). The worst case is `max_message_size` × `max_connections`: about 1 GB at the
   defaults (10 240 000 bytes × 100), plus buffer overhead. On a small host lower
   `max_connections` or `max_message_size`.
+  `max_line_length` adds a second bound: while a connection is reading a command or a
+  line it buffers at most that many bytes, so under attack the extra worst case is
+  `max_line_length` × `max_connections` (1 MiB × 100 = about 100 MB at the defaults).
+  A legitimate message is limited by `max_message_size`, not by this key, which only
+  needs to be larger than the longest line your clients send.
 - **Upstream timeouts:** each mail opens a fresh connection; `connect` bounds the TCP
   and TLS handshake, `command` each SMTP command, `data` the transfer of the message.
   When several upstreams fail slowly these add up, so a client may wait for the sum of
@@ -647,7 +653,7 @@ Start with the log: every failed attempt has a `WRN upstream failed` line with t
 | Client gets `421 4.4.0 Forwarding failed` | Every upstream failed with a non-SMTP error. Check the `WRN upstream failed` lines and their `error_class`: `connect` (host, port, firewall, DNS), `tls` (certificate, STARTTLS not offered, TLS version), `auth` (wrong credentials, mechanism not offered, no TLS), `timeout` (raise the upstream `timeouts` or check the network), `other` |
 | Client gets the upstream's own code, such as `550` or `554` | The upstream refused the mail (`smtp_5xx`) or asked to retry (`smtp_4xx`). Typical causes: sender not verified at the provider, unknown recipient, rate limit or quota at the provider |
 | Client gets `421 4.7.0 Too many connections` | `server.limits.max_connections` reached; raise it or find the client that leaks connections (`smtp_relay_connections_active`) |
-| Client gets `451 4.3.0 Error reading message` | A line longer than 2000 bytes, or the connection broke during `DATA`. Run with `logging.level: debug` to see the reason |
+| Client gets `451 4.3.0 Error reading message` | A line longer than `server.limits.max_line_length`, or the connection broke during `DATA`. Run with `logging.level: debug` to see the reason |
 | Client gets `552 5.3.4` or `452 4.5.3` | Message above `max_message_size`, or more than `max_recipients` recipients |
 | Client gets `530 5.7.0 Must issue a STARTTLS command first` | The listener has `force_tls: true`; the client must use STARTTLS |
 | Startup warning about an open relay | `allowed_networks` is empty or contains `0.0.0.0/0` / `::/0`. Narrow it |

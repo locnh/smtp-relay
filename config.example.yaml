@@ -43,6 +43,10 @@ server:
     max_connections: 100   # -1 = unlimited; shared by all listeners
     max_message_size: 10240000   # bytes
     max_recipients: 100
+    # Longest single protocol line in bytes (commands and DATA lines); minimum 1000, default 1048576.
+    # Lines over the limit get 451 4.3.0 and the connection is closed. Only protocol lines are
+    # buffered per connection, so the attack worst case is max_line_length x max_connections.
+    # max_line_length: 1048576
 
 access:
   # Who may connect. This is the ONLY gate: clients are not authenticated.
