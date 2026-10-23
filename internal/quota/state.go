@@ -227,16 +227,22 @@ const maxCorruptNameTries = 100
 // setAsideCorrupt renames the state file to <file>.corrupt-<unix nanoseconds>,
 // adding a counter if that name is taken, so earlier evidence is never
 // overwritten. Probing stops at the first name that is free or cannot be
-// examined; os.Rename then decides. It returns the new name, or "" if the
-// rename failed (the caller carries on with empty counters either way).
+// examined; os.Rename then decides. If every candidate name is taken it gives
+// up. It returns the new name, or "" if the file was not set aside (the caller
+// carries on with empty counters either way).
 func (m *Manager) setAsideCorrupt() string {
 	base := fmt.Sprintf("%s.corrupt-%d", m.stateFile, m.now().UnixNano())
-	dst := base
+	dst, free := base, false
 	for i := 1; i <= maxCorruptNameTries; i++ {
 		if _, err := os.Lstat(dst); err != nil {
+			free = true
 			break
 		}
 		dst = fmt.Sprintf("%s-%d", base, i)
+	}
+	if !free {
+		m.log.Warn().Str("file", m.stateFile).Msg("no free name to set aside corrupt quota state file")
+		return ""
 	}
 	if err := os.Rename(m.stateFile, dst); err != nil {
 		m.log.Warn().Err(err).Str("file", m.stateFile).Msg("cannot rename corrupt quota state file")

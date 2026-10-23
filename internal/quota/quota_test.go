@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
@@ -604,39 +605,114 @@ func TestRecordDuringSlowWriteStaysDirty(t *testing.T) {
 	assert.EqualValues(t, 2, used(t, m2, "ses"))
 }
 
-func windowSum(u *upstreamCounter, nowMin int64) int64 {
-	var sum int64
-	for minute, n := range u.buckets {
-		if minute > nowMin-u.windowMinutes {
-			sum += n
-		}
-	}
-	return sum
-}
-
 func (c *fakeClock) Set(t time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.t = t
 }
 
-func TestClockMovingBackAndForthMatchesDirectSum(t *testing.T) {
-	e := newEnv(t, UpstreamQuota{Name: "ses", Limit: 100, Window: 10 * time.Minute})
-	m := e.manager(t)
-	base := e.clock.Now()
+// clockModel is an independent model of the sliding window: it only knows the
+// minutes at which messages were recorded, never the manager's buckets.
+// Like the manager, it forgets a message for good the first time it is touched
+// (Record or read) at a clock reading where the message is outside the window,
+// so a later backward clock move does not resurrect it.
+type clockModel struct {
+	t      *testing.T
+	e      *env
+	m      *Manager
+	base   time.Time
+	events []int64
+}
 
-	steps := []struct {
-		min    int
-		record int
-	}{{0, 2}, {5, 1}, {9, 0}, {12, 0}, {3, 0}, {15, 1}, {8, 0}, {20, 0}, {14, 2}, {30, 0}, {1, 0}, {16, 1}, {25, 0}}
-	for _, st := range steps {
-		e.clock.Set(base.Add(time.Duration(st.min) * time.Minute))
-		recordN(m, "ses", st.record)
-		u := m.byName["ses"]
-		got := used(t, m, "ses")
-		assert.Equal(t, windowSum(u, m.nowMinute()), got, "minute %d", st.min)
-		assert.Equal(t, sumBuckets(u), got, "total == sum(buckets) at minute %d", st.min)
+func newClockModel(t *testing.T, window time.Duration) *clockModel {
+	e := newEnv(t, UpstreamQuota{Name: "ses", Limit: 1 << 30, Window: window})
+	return &clockModel{t: t, e: e, m: e.manager(t), base: e.clock.Now()}
+}
+
+func (c *clockModel) at(min int) {
+	c.e.clock.Set(c.base.Add(time.Duration(min) * time.Minute))
+}
+
+func (c *clockModel) touch() int64 {
+	nowMin := c.m.nowMinute()
+	w := c.m.byName["ses"].windowMinutes
+	kept := c.events[:0]
+	for _, minute := range c.events {
+		if minute > nowMin-w {
+			kept = append(kept, minute)
+		}
 	}
+	c.events = kept
+	return nowMin
+}
+
+func (c *clockModel) record(n int) {
+	for i := 0; i < n; i++ {
+		c.touch()
+		c.m.Record("ses")
+		c.events = append(c.events, c.m.nowMinute())
+	}
+}
+
+func (c *clockModel) check(msg string, args ...any) {
+	c.t.Helper()
+	c.touch()
+	assert.Equal(c.t, int64(len(c.events)), used(c.t, c.m, "ses"), append([]any{msg}, args...)...)
+}
+
+func TestClockMovingBackAndForthMatchesIndependentModel(t *testing.T) {
+	t.Run("scripted", func(t *testing.T) {
+		c := newClockModel(t, 10*time.Minute)
+		type step struct {
+			min    int
+			record int
+			reads  int
+		}
+		for i, st := range []step{
+			{0, 2, 1}, {5, 1, 2}, {9, 0, 1}, {12, 0, 3}, {3, 1, 1}, {15, 1, 1},
+			{20, 0, 2},
+			{14, 2, 1}, // clock moved back below the high-water mark of 20
+			{25, 0, 3}, // the minute-14 bucket is outside the window (cutoff 15)
+			{15, 0, 1}, {24, 0, 1}, {26, 0, 1}, {1, 0, 1}, {30, 0, 1}, {19, 1, 1}, {29, 0, 1},
+		} {
+			c.at(st.min)
+			c.record(st.record)
+			for r := 0; r < st.reads; r++ {
+				c.check("step %d minute %d read %d", i, st.min, r)
+			}
+		}
+	})
+
+	t.Run("minute 14 recorded after high-water 20 is not counted at 25", func(t *testing.T) {
+		c := newClockModel(t, 10*time.Minute)
+		c.at(20)
+		c.check("read at 20")
+		c.at(14)
+		c.record(1)
+		c.check("at 14")
+		c.at(25)
+		c.check("at 25")
+		assert.EqualValues(t, 0, used(t, c.m, "ses"))
+	})
+
+	t.Run("randomised", func(t *testing.T) {
+		c := newClockModel(t, 10*time.Minute)
+		rng := rand.New(rand.NewSource(42))
+		minute := 100
+		for i := 0; i < 2000; i++ {
+			switch rng.Intn(3) {
+			case 0:
+				minute += rng.Intn(61) - 30
+				c.at(minute)
+			case 1:
+				c.record(1 + rng.Intn(3))
+			}
+			c.check("step %d minute %d", i, minute)
+			if rng.Intn(4) == 0 {
+				c.check("repeat read step %d", i)
+			}
+		}
+	})
 }
 
 func TestBackwardClockPrunesLikeDirectSum(t *testing.T) {
@@ -715,4 +791,25 @@ func TestStaleTempCleanupWithSpecialCharsInPath(t *testing.T) {
 	e.manager(t)
 	_, err := os.Stat(p)
 	assert.True(t, os.IsNotExist(err))
+}
+
+func TestCorruptRenameGivesUpWhenAllNamesTaken(t *testing.T) {
+	e := newEnv(t, ses(100))
+	require.NoError(t, os.MkdirAll(filepath.Dir(e.file), 0o700))
+	base := fmt.Sprintf("%s.corrupt-%d", e.file, e.clock.Now().UnixNano())
+	require.NoError(t, os.WriteFile(base, []byte("old"), 0o600))
+	for i := 1; i <= maxCorruptNameTries; i++ {
+		require.NoError(t, os.WriteFile(fmt.Sprintf("%s-%d", base, i), []byte("old"), 0o600))
+	}
+	require.NoError(t, os.WriteFile(e.file, []byte("not json{"), 0o600))
+
+	m := e.manager(t)
+	assert.EqualValues(t, 0, used(t, m, "ses"))
+	assert.Contains(t, e.logs.String(), "no free name")
+	b, err := os.ReadFile(base + fmt.Sprintf("-%d", maxCorruptNameTries))
+	require.NoError(t, err)
+	assert.Equal(t, "old", string(b), "existing evidence is never overwritten")
+	b, err = os.ReadFile(base)
+	require.NoError(t, err)
+	assert.Equal(t, "old", string(b))
 }
