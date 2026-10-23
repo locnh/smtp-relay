@@ -118,14 +118,18 @@ func openRotator(f config.LoggingFileConfig) (*timberjack.Logger, error) {
 		return nil, errors.New("logging: file output requires logging.file.path")
 	}
 	// timberjack opens lazily on first write; probe now so bad paths fail at startup.
-	// Chmod makes the mode exact regardless of the process umask.
+	// Only a file created here gets its mode set; a pre-existing file keeps its
+	// mode, which may be owned by someone else (logrotate, ansible, root).
+	_, statErr := os.Stat(f.Path)
+	created := os.IsNotExist(statErr)
 	probe, err := os.OpenFile(f.Path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, logFileMode)
 	if err != nil {
 		return nil, fmt.Errorf("logging: open log file: %w", err)
 	}
-	if err := probe.Chmod(logFileMode); err != nil {
-		_ = probe.Close()
-		return nil, fmt.Errorf("logging: chmod log file: %w", err)
+	if created {
+		// Chmod makes the mode exact regardless of umask. A failure is ignored:
+		// the file is open and writable, so logging still works.
+		_ = probe.Chmod(logFileMode)
 	}
 	if err := probe.Close(); err != nil {
 		return nil, fmt.Errorf("logging: close log file probe: %w", err)

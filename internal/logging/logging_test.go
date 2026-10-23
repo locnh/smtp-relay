@@ -330,3 +330,61 @@ func TestNewTextFieldsOrder(t *testing.T) {
 		last = idx
 	}
 }
+
+func TestNewExistingFileModeUnchanged(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("file modes are not meaningful on windows")
+	}
+
+	tests := []struct {
+		name string
+		mode os.FileMode
+	}{
+		{"0644 kept", 0o644},
+		{"0600 kept", 0o600},
+		{"0666 kept", 0o666},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(t.TempDir(), "relay.log")
+			require.NoError(t, os.WriteFile(path, []byte("old\n"), 0o600))
+			require.NoError(t, os.Chmod(path, tt.mode))
+
+			cfg := baseCfg("file", "json")
+			cfg.File = config.LoggingFileConfig{Path: path}
+
+			var stdout, stderr bytes.Buffer
+			l, err := newWithWriters(cfg, &stdout, &stderr)
+			require.NoError(t, err)
+			t.Cleanup(func() { assert.NoError(t, l.Close()) })
+
+			info, err := os.Stat(path)
+			require.NoError(t, err)
+			assert.Equal(t, tt.mode, info.Mode().Perm())
+		})
+	}
+}
+
+func TestNewExistingFileNeverChmodedOnStart(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("file modes are not meaningful on windows")
+	}
+
+	path := filepath.Join(t.TempDir(), "relay.log")
+	require.NoError(t, os.WriteFile(path, nil, 0o644))
+
+	cfg := baseCfg("file", "json")
+	cfg.File = config.LoggingFileConfig{Path: path}
+
+	var stdout, stderr bytes.Buffer
+	l, err := newWithWriters(cfg, &stdout, &stderr)
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, l.Close()) })
+
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o644), info.Mode().Perm(), "existing file mode must not be changed")
+}
