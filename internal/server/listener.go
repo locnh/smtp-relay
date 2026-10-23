@@ -37,7 +37,7 @@ func (g *gate) closeIdle() {
 	g.mu.Lock()
 	var idle []*gatedConn
 	for c := range g.open {
-		if !c.busy.Load() {
+		if !c.busy.Load() && c.inflight.Load() == 0 {
 			idle = append(idle, c)
 		}
 	}
@@ -132,8 +132,10 @@ type gatedConn struct {
 
 	// busy is true between an accepted MAIL FROM and the end of the transaction.
 	busy atomic.Bool
-	once sync.Once
-	err  error
+	// inflight counts Data calls; with BDAT one can outlive the transaction state.
+	inflight atomic.Int32
+	once     sync.Once
+	err      error
 }
 
 func (c *gatedConn) Close() error {

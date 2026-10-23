@@ -445,20 +445,24 @@ func TestMaxRecipients(t *testing.T) {
 	c0.Server.Limits.MaxRecipients = 2
 	h := start(t, c0)
 	c := dialRaw(t, h.addr(0))
-	c.greet()
+	l, _ := c.reply()
+	require.True(t, strings.HasPrefix(l, "220 "))
+	ehlo := c.expect("EHLO client.test", "250 ")
+	assert.Contains(t, strings.Join(ehlo, "\n"), "LIMITS RCPTMAX=2")
 	c.expect("MAIL FROM:<a@example.com>", "250 ")
 	c.expect("RCPT TO:<1@x.test>", "250 ")
 	c.expect("RCPT TO:<2@x.test>", "250 ")
 	c.expect("RCPT TO:<3@x.test>", "452 4.5.3 ")
-	rejected, _, _ := h.ev.snapshot()
-	assert.Equal(t, []string{"too_many_recipients"}, rejected)
 
 	c.expect("DATA", "354 ")
 	_, err := c.conn.Write([]byte("Subject: s\r\n\r\nb\r\n.\r\n"))
 	require.NoError(t, err)
-	l, _ := c.reply()
+	l, _ = c.reply()
 	assert.True(t, strings.HasPrefix(l, "250 "))
 	assert.Equal(t, []string{"1@x.test", "2@x.test"}, h.del.messages()[0].To)
+	// The mail was delivered, so it must not also be counted as rejected.
+	rejected, _, _ := h.ev.snapshot()
+	assert.Empty(t, rejected)
 
 	// The recipient count starts over for the next transaction.
 	assert.True(t, strings.HasPrefix(c.sendMail("a@example.com", []string{"4@x.test", "5@x.test"}, "Subject: s\r\n\r\nb"), "250 "))
@@ -517,6 +521,7 @@ func TestSlowDripDataCutByTotalDeadline(t *testing.T) {
 	l, _ := c.reply()
 	elapsed := time.Since(start)
 	assert.True(t, strings.HasPrefix(l, "421 4.4.2 "), l)
+	assert.Contains(t, l, "Data timeout")
 	assert.GreaterOrEqual(t, elapsed, 450*time.Millisecond)
 	assert.Less(t, elapsed, 1500*time.Millisecond, "per-line read timeout must not extend the DATA budget")
 	c.expectEOF()
@@ -646,6 +651,9 @@ func TestImplicitTLSGateRunsBeforeHandshake(t *testing.T) {
 	c := dialRaw(t, h.addr(0))
 	l, _ := c.reply()
 	assert.Equal(t, "554 5.7.1 Access denied", l)
+	require.Eventually(t, func() bool { _, _, cr := h.ev.snapshot(); return len(cr) == 1 }, 2*time.Second, 5*time.Millisecond)
+	_, _, cr := h.ev.snapshot()
+	assert.Equal(t, "denied_network", cr[0][1])
 }
 
 func TestTLSProfiles(t *testing.T) {
@@ -747,6 +755,8 @@ func TestNewErrors(t *testing.T) {
 		{"unknown listener mode", func(c *Config) {
 			c.Server.Listen = []config.ListenConfig{{Address: "127.0.0.1:0", TLS: "bogus"}}
 		}},
+		{"max_connections zero", func(c *Config) { c.Server.Limits.MaxConnections = 0 }},
+		{"max_connections below -1", func(c *Config) { c.Server.Limits.MaxConnections = -2 }},
 		{"nil deliverer", func(c *Config) { c.Deliverer = nil }},
 	}
 	for _, tc := range tests {
@@ -872,6 +882,7 @@ func TestShutdownExpiredContextForcesClose(t *testing.T) {
 		close(entered)
 		<-ctx.Done()
 		close(delivered)
+		time.Sleep(100 * time.Millisecond) // unwinding takes a while; Shutdown must wait for it
 		return relay.Result{Err: ctx.Err()}
 	}
 	c := dialRaw(t, h.addr(0))
@@ -886,6 +897,8 @@ func TestShutdownExpiredContextForcesClose(t *testing.T) {
 	err = h.srv.Shutdown(ctx)
 	assert.ErrorIs(t, err, context.DeadlineExceeded)
 	assert.Less(t, time.Since(begin), 3*time.Second)
+	_, done, _ := h.ev.snapshot()
+	assert.Len(t, done, 1, "MessageDone must have fired before Shutdown returned")
 
 	select {
 	case <-delivered:
@@ -930,4 +943,217 @@ func TestConnEventsBalancedAfterBurst(t *testing.T) {
 	defer h.ev.mu.Unlock()
 	assert.Equal(t, n, h.ev.accepted["127.0.0.1:0"])
 	assert.Equal(t, n, h.ev.closed["127.0.0.1:0"])
+}
+
+func TestShutdownTwiceReturnsNil(t *testing.T) {
+	h := start(t, baseConfig())
+	require.NoError(t, h.srv.Shutdown(context.Background()))
+	assert.NoError(t, h.srv.Shutdown(context.Background()))
+}
+
+func TestShutdownLeakedDeliveryIsBounded(t *testing.T) {
+	h := start(t, baseConfig())
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	h.del.fn = func(context.Context, *relay.Message) relay.Result {
+		close(entered)
+		<-release // ignores ctx on purpose
+		return relay.Result{Upstream: "up1"}
+	}
+	h.srv.drainGrace = 100 * time.Millisecond
+	c := dialRaw(t, h.addr(0))
+	c.greet()
+	_, err := fmt.Fprint(c.conn, "MAIL FROM:<a@example.com>\r\nRCPT TO:<b@x.test>\r\nDATA\r\nSubject: s\r\n\r\nb\r\n.\r\n")
+	require.NoError(t, err)
+	<-entered
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	begin := time.Now()
+	assert.ErrorIs(t, h.srv.Shutdown(ctx), context.DeadlineExceeded)
+	assert.Less(t, time.Since(begin), 2*time.Second)
+	close(release)
+}
+
+func TestIdleClientCutAtReadTimeout(t *testing.T) {
+	c0 := baseConfig()
+	c0.Server.Timeouts.Read = 300 * time.Millisecond
+	h := start(t, c0)
+	c := dialRaw(t, h.addr(0))
+	c.greet()
+	begin := time.Now()
+	l, _ := c.reply()
+	assert.True(t, strings.HasPrefix(l, "421 4.4.2 "), l)
+	assert.GreaterOrEqual(t, time.Since(begin), 250*time.Millisecond)
+	assert.Less(t, time.Since(begin), 2*time.Second)
+	c.expectEOF()
+}
+
+func TestTLSHandshakeFailureReleasesSlot(t *testing.T) {
+	certFile, keyFile := testCert(t)
+	c0 := baseConfig(config.ListenConfig{Address: "127.0.0.1:0", TLS: "tls"})
+	c0.Server.TLS = config.ServerTLSConfig{CertFile: certFile, KeyFile: keyFile}
+	c0.Server.Limits.MaxConnections = 1
+	h := start(t, c0)
+
+	for i := 0; i < 3; i++ {
+		conn, err := net.Dial("tcp", h.addr(0))
+		require.NoError(t, err)
+		_, err = conn.Write([]byte("this is not a TLS ClientHello\r\n\r\n"))
+		require.NoError(t, err)
+		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		_, _ = bufio.NewReader(conn).ReadByte() // server closes (possibly after a TLS alert)
+		conn.Close()
+		require.Eventually(t, func() bool { live, _ := h.ev.liveCount(); return live == 0 }, 3*time.Second, 10*time.Millisecond)
+	}
+	// With max_connections=1 a leaked slot would make this fail.
+	conn, err := tls.Dial("tcp", h.addr(0), &tls.Config{InsecureSkipVerify: true})
+	require.NoError(t, err)
+	c := newRaw(t, conn)
+	c.greet()
+	_, _, cr := h.ev.snapshot()
+	assert.Empty(t, cr)
+}
+
+func TestMessageDoneFiresWhenClientDisconnectsMidDelivery(t *testing.T) {
+	h := start(t, baseConfig())
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	h.del.fn = func(context.Context, *relay.Message) relay.Result {
+		close(entered)
+		<-release
+		return relay.Result{Upstream: "up1", Attempts: []relay.Attempt{{Upstream: "up1"}}}
+	}
+	c := dialRaw(t, h.addr(0))
+	c.greet()
+	_, err := fmt.Fprint(c.conn, "MAIL FROM:<a@example.com>\r\nRCPT TO:<b@x.test>\r\nDATA\r\nSubject: s\r\n\r\nb\r\n.\r\n")
+	require.NoError(t, err)
+	<-entered
+	c.conn.Close()
+	close(release)
+
+	require.Eventually(t, func() bool { _, d, _ := h.ev.snapshot(); return len(d) == 1 }, 3*time.Second, 10*time.Millisecond)
+	require.Eventually(t, func() bool { live, _ := h.ev.liveCount(); return live == 0 }, 3*time.Second, 10*time.Millisecond)
+}
+
+func TestLogoutClearsBusy(t *testing.T) {
+	certFile, keyFile := testCert(t)
+	c0 := baseConfig(config.ListenConfig{Address: "127.0.0.1:0", TLS: "starttls"})
+	c0.Server.TLS = config.ServerTLSConfig{CertFile: certFile, KeyFile: keyFile}
+	h := start(t, c0)
+	c := dialRaw(t, h.addr(0))
+	c.greet()
+	c.expect("MAIL FROM:<a@example.com>", "250 ")
+	c.expect("STARTTLS", "220 ")
+	tc := tls.Client(c.conn, &tls.Config{InsecureSkipVerify: true})
+	require.NoError(t, tc.Handshake())
+
+	// STARTTLS discarded the transaction; shutdown must not wait for this idle connection.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	begin := time.Now()
+	require.NoError(t, h.srv.Shutdown(ctx))
+	assert.Less(t, time.Since(begin), time.Second)
+}
+
+func (c *rawClient) bdat(n int, last bool, payload string) {
+	c.t.Helper()
+	suffix := ""
+	if last {
+		suffix = " LAST"
+	}
+	_, err := fmt.Fprintf(c.conn, "BDAT %d%s\r\n%s", n, suffix, payload)
+	require.NoError(c.t, err)
+}
+
+func (c *rawClient) envelope() {
+	c.t.Helper()
+	c.expect("MAIL FROM:<a@example.com>", "250 ")
+	c.expect("RCPT TO:<b@x.test>", "250 ")
+}
+
+func TestBDATHappyPath(t *testing.T) {
+	h := start(t, baseConfig())
+	c := dialRaw(t, h.addr(0))
+	c.greet()
+	c.envelope()
+
+	body := "Subject: chunked\r\n\r\n.leading dot kept\r\nend\r\n"
+	c.bdat(10, false, body[:10])
+	l, _ := c.reply()
+	assert.True(t, strings.HasPrefix(l, "250 "), l)
+	c.bdat(len(body)-10, true, body[10:])
+	l, _ = c.reply()
+	assert.Equal(t, "250 2.0.0 OK: queued", l)
+
+	msgs := h.del.messages()
+	require.Len(t, msgs, 1)
+	assert.Equal(t, body, string(msgs[0].Data))
+	_, done, _ := h.ev.snapshot()
+	require.Len(t, done, 1)
+	assert.Equal(t, "chunked", done[0].s.Subject)
+	assert.Equal(t, len(body), done[0].s.Size)
+
+	// The session is reusable afterwards.
+	assert.True(t, strings.HasPrefix(c.sendMail("a@example.com", []string{"c@x.test"}, "Subject: s\r\n\r\nb"), "250 "))
+}
+
+func TestBDATSlowChunksCutByDataTimeout(t *testing.T) {
+	c0 := baseConfig()
+	c0.Server.Timeouts.Data = 500 * time.Millisecond
+	c0.Server.Timeouts.Read = 5 * time.Second
+	h := start(t, c0)
+	c := dialRaw(t, h.addr(0))
+	c.greet()
+	c.envelope()
+
+	begin := time.Now()
+	var cutAt time.Duration
+	for i := 0; i < 40; i++ {
+		_ = c.conn.SetWriteDeadline(time.Now().Add(time.Second))
+		if _, err := fmt.Fprintf(c.conn, "BDAT 1\r\nx"); err != nil {
+			cutAt = time.Since(begin)
+			break
+		}
+		_ = c.conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if _, err := c.r.ReadLine(); err != nil {
+			cutAt = time.Since(begin)
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	require.NotZero(t, cutAt, "connection was never cut")
+	assert.GreaterOrEqual(t, cutAt, 450*time.Millisecond)
+	assert.Less(t, cutAt, 1500*time.Millisecond, "per-command read timeout must not extend the DATA budget")
+
+	_, done, _ := h.ev.snapshot()
+	assert.Empty(t, done)
+	assert.Empty(t, h.del.messages())
+	require.Eventually(t, func() bool { live, _ := h.ev.liveCount(); return live == 0 }, 3*time.Second, 10*time.Millisecond)
+}
+
+func TestBDATResetAndDisconnectMidTransfer(t *testing.T) {
+	h := start(t, baseConfig())
+	// Repeat to give the race detector a chance at the Reset/Data overlap.
+	for i := 0; i < 20; i++ {
+		c := dialRaw(t, h.addr(0))
+		c.greet()
+		c.envelope()
+		c.bdat(3, false, "abc")
+		c.reply()
+		c.expect("RSET", "250 ")
+		// A fresh transaction on the same connection must still work and not be dropped.
+		assert.True(t, strings.HasPrefix(c.sendMail("a@example.com", []string{"b@x.test"}, "Subject: s\r\n\r\nb"), "250 "), "iteration %d", i)
+		c.conn.Close()
+
+		d := dialRaw(t, h.addr(0))
+		d.greet()
+		d.envelope()
+		d.bdat(3, false, "abc")
+		d.reply()
+		d.conn.Close()
+	}
+	_, done, _ := h.ev.snapshot()
+	assert.Len(t, done, 20, "only the completed mails are delivered")
+	require.Eventually(t, func() bool { live, _ := h.ev.liveCount(); return live == 0 }, 3*time.Second, 10*time.Millisecond)
 }

@@ -75,13 +75,13 @@ type listenerState struct {
 // Server is the SMTP receiving side: one go-smtp server per listener sharing
 // one admission gate.
 type Server struct {
-	policy        *Policy
-	deliverer     Deliverer
-	events        Events
-	log           zerolog.Logger
-	newID         func() string
-	maxRecipients int
-	dataTimeout   time.Duration
+	policy      *Policy
+	deliverer   Deliverer
+	events      Events
+	log         zerolog.Logger
+	newID       func() string
+	dataTimeout time.Duration
+	drainGrace  time.Duration
 
 	gate      *gate
 	listeners []*listenerState
@@ -94,7 +94,13 @@ type Server struct {
 
 	closing atomic.Bool
 	wg      sync.WaitGroup
+	// inflight counts Session.Data calls, including their MessageDone.
+	inflight atomic.Int64
 }
+
+// defaultDrainGrace bounds how long Shutdown waits, after force-closing, for
+// deliveries to observe the cancelled context and finish.
+const defaultDrainGrace = 5 * time.Second
 
 // New validates the configuration (including loading the TLS keypair when a
 // listener needs it) and builds the servers. It binds nothing.
@@ -109,15 +115,18 @@ func New(c Config) (*Server, error) {
 		c.NewID = uuid.NewString
 	}
 	sc := c.Server
+	if sc.Limits.MaxConnections == 0 || sc.Limits.MaxConnections < -1 {
+		return nil, errors.New("server: max_connections must be -1 or >= 1")
+	}
 
 	s := &Server{
-		policy:        c.Policy,
-		deliverer:     c.Deliverer,
-		events:        c.Events,
-		log:           c.Log,
-		newID:         c.NewID,
-		maxRecipients: sc.Limits.MaxRecipients,
-		dataTimeout:   sc.Timeouts.Data,
+		policy:      c.Policy,
+		deliverer:   c.Deliverer,
+		events:      c.Events,
+		log:         c.Log,
+		newID:       c.NewID,
+		dataTimeout: sc.Timeouts.Data,
+		drainGrace:  defaultDrainGrace,
 	}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	s.gate = newGate(c.Policy, sc.Limits.MaxConnections, c.Events, c.Log)
@@ -165,6 +174,7 @@ func New(c Config) (*Server, error) {
 		srv.ReadTimeout = sc.Timeouts.Read
 		srv.WriteTimeout = sc.Timeouts.Write
 		srv.MaxMessageBytes = sc.Limits.MaxMessageSize
+		srv.MaxRecipients = sc.Limits.MaxRecipients
 		srv.EnableSMTPUTF8 = true
 		srv.ErrorLog = zlogger{c.Log}
 		if l.TLS == "starttls" {
@@ -229,8 +239,13 @@ func (s *Server) Addrs() []net.Addr {
 func (s *Server) CertNotAfter() (time.Time, bool) { return s.notAfter, s.hasCert }
 
 // Shutdown stops accepting, closes idle connections and waits for in-flight
-// mails. When ctx expires the remaining connections are closed and delivery is
-// cancelled.
+// mails. When ctx expires the remaining connections are closed, delivery is
+// cancelled and Shutdown waits a short grace period for deliveries to unwind.
+//
+// Once Shutdown returns nil, or returns after the grace period, no further
+// MessageDone fires. The exception is a Deliverer that ignores its context for
+// longer than the grace period; that is logged with the number of leaked
+// deliveries. Calling Shutdown again returns nil.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.closing.Store(true)
 	s.closeRaw()
@@ -249,7 +264,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		case err := <-errs:
 			pending--
 			switch {
-			case err == nil, errors.Is(err, net.ErrClosed):
+			case err == nil, errors.Is(err, net.ErrClosed), errors.Is(err, smtp.ErrServerClosed):
 			case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
 				timedOut = true
 			default:
@@ -265,11 +280,39 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		all = append(all, ctx.Err())
 	}
 	s.wg.Wait()
+	if timedOut {
+		s.waitInflight()
+	}
 	s.cancel()
 	return errors.Join(all...)
 }
 
+func (s *Server) waitInflight() {
+	deadline := time.Now().Add(s.drainGrace)
+	for s.inflight.Load() > 0 {
+		if time.Now().After(deadline) {
+			s.log.Warn().Int64("leaked_deliveries", s.inflight.Load()).
+				Msg("deliveries still running after shutdown grace period")
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 type zlogger struct{ l zerolog.Logger }
 
-func (z zlogger) Printf(format string, v ...interface{}) { z.l.Warn().Msgf(format, v...) }
-func (z zlogger) Println(v ...interface{})               { z.l.Warn().Msg(strings.TrimSpace(fmt.Sprintln(v...))) }
+// go-smtp reports routine per-connection trouble (failed handshakes, resets,
+// EOF-like errors) through this logger; only panics and accept failures matter.
+func (z zlogger) Printf(format string, v ...interface{}) { z.log(fmt.Sprintf(format, v...)) }
+func (z zlogger) Println(v ...interface{})               { z.log(strings.TrimSpace(fmt.Sprintln(v...))) }
+
+func (z zlogger) log(msg string) {
+	switch {
+	case strings.Contains(msg, "panic"):
+		z.l.Error().Msg(msg)
+	case strings.Contains(msg, "accept error"):
+		z.l.Warn().Msg(msg)
+	default:
+		z.l.Debug().Msg(msg)
+	}
+}
