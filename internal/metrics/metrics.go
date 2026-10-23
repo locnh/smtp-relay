@@ -22,7 +22,7 @@ const (
 )
 
 var (
-	rejectReasons = setOf("sender_denied", "null_sender", "size_exceeded", "too_many_recipients")
+	rejectReasons = setOf("sender_denied", "null_sender", "size_exceeded")
 	failReasons   = setOf("upstream_error")
 	connResults   = setOf("denied_network", "rejected_limit")
 	errorClasses  = setOf(
