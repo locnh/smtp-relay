@@ -16,19 +16,54 @@ import (
 var upstreamName = regexp.MustCompile(`^[a-z0-9_-]+$`)
 
 type validator struct {
-	cfg     *Config
-	present map[string]bool
-	errs    []string
+	cfg      *Config
+	present  map[string]bool
+	expanded map[string]bool
+	errs     []string
 }
 
 func (v *validator) errf(path, format string, args ...any) {
 	v.errs = append(v.errs, path+": "+fmt.Sprintf(format, args...))
 }
 
+const hidden = "<value from environment, not shown>"
+
+// q quotes a configured value for a message, unless the value at path came from
+// a ${VAR} substitution: a secret placed in the wrong field must not be echoed.
+func (v *validator) q(path string, val any) string {
+	if v.expanded[path] {
+		return hidden
+	}
+	if s, ok := val.(string); ok {
+		return fmt.Sprintf("%q", s)
+	}
+	return fmt.Sprint(val)
+}
+
+// got renders ", got <value>" for validation messages, or a note that the
+// value is hidden when it came from the environment.
+func (v *validator) got(path string, val any) string {
+	if v.expanded[path] {
+		return " (" + hidden + ")"
+	}
+	return ", got " + v.q(path, val)
+}
+
+// detail appends err's text unless any of the given paths is env-derived,
+// because OS errors often contain the file path that was tried.
+func (v *validator) detail(err error, paths ...string) string {
+	for _, p := range paths {
+		if v.expanded[p] {
+			return ""
+		}
+	}
+	return ": " + err.Error()
+}
+
 // validate checks the defaulted config, resolves *_file secrets, parses CIDRs
 // and records warnings. It returns a *ValidationError holding every problem.
-func (c *Config) validate(present map[string]bool) error {
-	v := &validator{cfg: c, present: present}
+func (c *Config) validate(present, expanded map[string]bool) error {
+	v := &validator{cfg: c, present: present, expanded: expanded}
 	v.server()
 	v.access()
 	v.upstreams()
@@ -54,7 +89,7 @@ func hasCRLF(s string) bool { return strings.ContainsAny(s, "\r\n") }
 
 func (v *validator) minDuration(path string, d, min time.Duration) {
 	if d < min {
-		v.errf(path, "must be at least %s, got %s", min, d)
+		v.errf(path, "must be at least %s%s", min, v.got(path, d))
 	}
 }
 
@@ -71,14 +106,14 @@ func (v *validator) server() {
 	seen := map[string]bool{}
 	for i, l := range s.Listen {
 		p := fmt.Sprintf("server.listen[%d]", i)
-		if err := checkHostPort(l.Address, 0); err != nil {
-			v.errf(p+".address", "%v", err)
+		if reason := checkHostPort(l.Address); reason != "" {
+			v.errf(p+".address", "%s%s", reason, v.got(p+".address", l.Address))
 		} else if seen[l.Address] {
-			v.errf(p+".address", "duplicate listen address %q", l.Address)
+			v.errf(p+".address", "duplicate listen address %s", v.q(p+".address", l.Address))
 		}
 		seen[l.Address] = true
 		if !oneOf(l.TLS, "none", "starttls", "tls") {
-			v.errf(p+".tls", "must be none, starttls or tls, got %q", l.TLS)
+			v.errf(p+".tls", "must be none, starttls or tls%s", v.got(p+".tls", l.TLS))
 		}
 		if l.TLS == "starttls" || l.TLS == "tls" {
 			needTLS = true
@@ -89,7 +124,7 @@ func (v *validator) server() {
 	}
 
 	if !oneOf(s.TLS.Profile, "default", "modern", "intermediate", "legacy") {
-		v.errf("server.tls.profile", "must be default, modern, intermediate or legacy, got %q", s.TLS.Profile)
+		v.errf("server.tls.profile", "must be default, modern, intermediate or legacy%s", v.got("server.tls.profile", s.TLS.Profile))
 	}
 	if needTLS {
 		v.keyPair("server.tls", "cert_file", s.TLS.CertFile, "key_file", s.TLS.KeyFile, true)
@@ -101,13 +136,13 @@ func (v *validator) server() {
 	v.minDuration("server.timeouts.shutdown", s.Timeouts.Shutdown, time.Second)
 
 	if s.Limits.MaxConnections < -1 {
-		v.errf("server.limits.max_connections", "must be -1 (unlimited) or positive, got %d", s.Limits.MaxConnections)
+		v.errf("server.limits.max_connections", "must be -1 (unlimited) or positive%s", v.got("server.limits.max_connections", s.Limits.MaxConnections))
 	}
 	if s.Limits.MaxMessageSize < 0 {
-		v.errf("server.limits.max_message_size", "must be positive, got %d", s.Limits.MaxMessageSize)
+		v.errf("server.limits.max_message_size", "must be positive%s", v.got("server.limits.max_message_size", s.Limits.MaxMessageSize))
 	}
 	if s.Limits.MaxRecipients < 0 {
-		v.errf("server.limits.max_recipients", "must be positive, got %d", s.Limits.MaxRecipients)
+		v.errf("server.limits.max_recipients", "must be positive%s", v.got("server.limits.max_recipients", s.Limits.MaxRecipients))
 	}
 }
 
@@ -125,21 +160,22 @@ func (v *validator) keyPair(path, certKey, cert, keyKey, key string, required bo
 		v.errf(path+"."+keyKey, "must be set together with %s", certKey)
 	default:
 		if _, err := tls.LoadX509KeyPair(cert, key); err != nil {
-			v.errf(path, "cannot load key pair (%s, %s): %v", certKey, keyKey, err)
+			v.errf(path, "cannot load key pair (%s, %s)%s", certKey, keyKey, v.detail(err, path+"."+certKey, path+"."+keyKey))
 		}
 	}
 }
 
-func checkHostPort(addr string, minPort int) error {
+// checkHostPort returns "" for a valid host:port, otherwise a reason that
+// does not contain the address (it may be env-derived).
+func checkHostPort(addr string) string {
 	_, port, err := net.SplitHostPort(addr)
 	if err != nil {
-		return fmt.Errorf("invalid address %q: %v", addr, err)
+		return "invalid address, want host:port"
 	}
-	n, err := strconv.Atoi(port)
-	if err != nil || n < minPort || n > 65535 {
-		return fmt.Errorf("invalid port in address %q", addr)
+	if n, err := strconv.Atoi(port); err != nil || n < 0 || n > 65535 {
+		return "invalid address, port must be between 0 and 65535"
 	}
-	return nil
+	return ""
 }
 
 func (v *validator) access() {
@@ -149,15 +185,19 @@ func (v *validator) access() {
 		p := fmt.Sprintf("access.allowed_networks[%d]", i)
 		ip, n, err := net.ParseCIDR(s)
 		if err != nil {
-			v.errf(p, "invalid CIDR %q", s)
+			v.errf(p, "invalid CIDR%s", v.got(p, s))
 			continue
 		}
 		if !ip.Equal(n.IP) {
-			v.errf(p, "CIDR %q has host bits set (did you mean %s?)", s, n)
+			if v.expanded[p] {
+				v.errf(p, "CIDR has host bits set (%s)", hidden)
+			} else {
+				v.errf(p, "CIDR %q has host bits set (did you mean %s?)", s, n)
+			}
 			continue
 		}
 		if ones, _ := n.Mask.Size(); ones == 0 {
-			v.cfg.warn(fmt.Sprintf("%s: %s allows every address (open relay)", p, s))
+			v.cfg.warn(fmt.Sprintf("%s: %s allows every address (open relay)", p, v.q(p, s)))
 		}
 		a.Networks = append(a.Networks, n)
 	}
@@ -171,7 +211,7 @@ func (v *validator) access() {
 		case hasCRLF(s):
 			v.errf(p, "must not contain CR or LF")
 		case strings.Count(s, "@") != 1:
-			v.errf(p, "must contain exactly one @, got %q", s)
+			v.errf(p, "must contain exactly one @%s", v.got(p, s))
 		}
 	}
 	for i, s := range a.AllowedSenderDomains {
@@ -180,7 +220,7 @@ func (v *validator) access() {
 		case hasCRLF(s):
 			v.errf(p, "must not contain CR or LF")
 		case s == "" || strings.Contains(s, "@"):
-			v.errf(p, "must be a non-empty domain without @, got %q", s)
+			v.errf(p, "must be a non-empty domain without @%s", v.got(p, s))
 		}
 	}
 }
@@ -199,9 +239,9 @@ func (v *validator) upstreams() {
 		case u.Name == "":
 			v.errf(p+".name", "required")
 		case !upstreamName.MatchString(u.Name):
-			v.errf(p+".name", "must match [a-z0-9_-]+, got %q", u.Name)
+			v.errf(p+".name", "must match [a-z0-9_-]+%s", v.got(p+".name", u.Name))
 		case names[u.Name]:
-			v.errf(p+".name", "duplicate upstream name %q", u.Name)
+			v.errf(p+".name", "duplicate upstream name %s", v.q(p+".name", u.Name))
 		}
 		names[u.Name] = true
 
@@ -209,10 +249,10 @@ func (v *validator) upstreams() {
 			v.errf(p+".host", "required")
 		}
 		if u.Port < 1 || u.Port > 65535 { // an explicit "port: 0" is not defaulted, so it lands here
-			v.errf(p+".port", "must be between 1 and 65535, got %d", u.Port)
+			v.errf(p+".port", "must be between 1 and 65535%s", v.got(p+".port", u.Port))
 		}
 		if !oneOf(u.TLS, "starttls", "tls", "none") {
-			v.errf(p+".tls", "must be starttls, tls or none, got %q", u.TLS)
+			v.errf(p+".tls", "must be starttls, tls or none%s", v.got(p+".tls", u.TLS))
 		}
 
 		v.upstreamAuth(p, u)
@@ -224,7 +264,7 @@ func (v *validator) upstreams() {
 
 		if q := u.Quota; q != nil {
 			if q.Limit <= 0 {
-				v.errf(p+".quota.limit", "must be greater than 0, got %d", q.Limit)
+				v.errf(p+".quota.limit", "must be greater than 0%s", v.got(p+".quota.limit", q.Limit))
 			}
 			v.minDuration(p+".quota.window", q.Window, time.Minute)
 		}
@@ -241,7 +281,7 @@ func (v *validator) upstreamAuth(p string, u *UpstreamConfig) {
 		v.errf(p+".username", "required when auth is set")
 	}
 	if !oneOf(a.Mechanism, "auto", "plain", "login") {
-		v.errf(p+".mechanism", "must be auto, plain or login, got %q", a.Mechanism)
+		v.errf(p+".mechanism", "must be auto, plain or login%s", v.got(p+".mechanism", a.Mechanism))
 	}
 	if u.TLS == "none" && !a.AllowInsecureAuth {
 		v.errf(p, "credentials would be sent unencrypted with tls: none; use starttls/tls or set allow_insecure_auth: true")
@@ -258,12 +298,12 @@ func (v *validator) upstreamAuth(p string, u *UpstreamConfig) {
 		}
 		b, err := os.ReadFile(a.PasswordFile)
 		if err != nil {
-			v.errf(p+".password_file", "cannot read %q: %v", a.PasswordFile, unwrapPathError(err))
+			v.errf(p+".password_file", "cannot read %s%s", v.q(p+".password_file", a.PasswordFile), v.detail(unwrapPathError(err), p+".password_file"))
 			break
 		}
 		a.Password = Secret(trimOneNewline(string(b)))
 		if a.Password == "" {
-			v.errf(p+".password_file", "%q is empty", a.PasswordFile)
+			v.errf(p+".password_file", "%s is empty", v.q(p+".password_file", a.PasswordFile))
 		}
 	case pw:
 		if a.Password == "" {
@@ -300,9 +340,9 @@ func (v *validator) upstreamTLSOptions(p string, u *UpstreamConfig) {
 		b, err := os.ReadFile(o.CAFile)
 		switch {
 		case err != nil:
-			v.errf(p+".ca_file", "cannot read %q: %v", o.CAFile, unwrapPathError(err))
+			v.errf(p+".ca_file", "cannot read %s%s", v.q(p+".ca_file", o.CAFile), v.detail(unwrapPathError(err), p+".ca_file"))
 		case !x509.NewCertPool().AppendCertsFromPEM(b):
-			v.errf(p+".ca_file", "no valid PEM certificate found in %q", o.CAFile)
+			v.errf(p+".ca_file", "no valid PEM certificate found in %s", v.q(p+".ca_file", o.CAFile))
 		}
 	}
 	v.keyPair(p, "client_cert_file", o.ClientCertFile, "client_key_file", o.ClientKeyFile, false)
@@ -324,21 +364,21 @@ func (v *validator) state() {
 		return
 	}
 	if err := checkDirWritable(filepath.Dir(f)); err != nil {
-		v.errf("state.file", "directory is not writable: %v", err)
+		v.errf("state.file", "directory is not writable%s", v.detail(err, "state.file"))
 	}
 }
 
 func (v *validator) logging() {
 	l := &v.cfg.Logging
 	if !oneOf(l.Level, "trace", "debug", "info", "warn", "error") {
-		v.cfg.warn(fmt.Sprintf("logging.level: unknown level %q, using info", l.Level))
+		v.cfg.warn(fmt.Sprintf("logging.level: unknown level %s, using info", v.q("logging.level", l.Level)))
 		l.Level = "info"
 	}
 	if !oneOf(l.Format, "text", "json") {
-		v.errf("logging.format", "must be text or json, got %q", l.Format)
+		v.errf("logging.format", "must be text or json%s", v.got("logging.format", l.Format))
 	}
 	if !oneOf(l.Output, "stdout", "stderr", "file") {
-		v.errf("logging.output", "must be stdout, stderr or file, got %q", l.Output)
+		v.errf("logging.output", "must be stdout, stderr or file%s", v.got("logging.output", l.Output))
 		return
 	}
 	if l.Output != "file" {
@@ -349,17 +389,17 @@ func (v *validator) logging() {
 		return
 	}
 	if err := checkDirWritable(filepath.Dir(l.File.Path)); err != nil {
-		v.errf("logging.file.path", "directory is not writable: %v", err)
+		v.errf("logging.file.path", "directory is not writable%s", v.detail(err, "logging.file.path"))
 	}
 }
 
 func (v *validator) metrics() {
 	m := &v.cfg.Metrics
-	if err := checkHostPort(m.Listen, 0); err != nil {
-		v.errf("metrics.listen", "%v", err)
+	if reason := checkHostPort(m.Listen); reason != "" {
+		v.errf("metrics.listen", "%s%s", reason, v.got("metrics.listen", m.Listen))
 	}
 	if !strings.HasPrefix(m.Path, "/") {
-		v.errf("metrics.path", "must start with /, got %q", m.Path)
+		v.errf("metrics.path", "must start with /%s", v.got("metrics.path", m.Path))
 	}
 }
 

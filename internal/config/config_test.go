@@ -731,3 +731,117 @@ func TestSenderDomainAndTLSFileRules(t *testing.T) {
 		})
 	}
 }
+
+func TestValidationNeverEchoesEnvDerivedValues(t *testing.T) {
+	const secret = "S3cr3t-Value-XYZ"
+	// Each case also carries an unrelated validation error (under a top-level
+	// key the case does not use) to prove errors stay collected. Decode-stage
+	// errors (wrong type) are reported before validation, so they are exempt.
+	others := []struct{ key, yaml, path string }{
+		{"server:", "\nserver: {limits: {max_recipients: -1}}", "server.limits.max_recipients"},
+		{"access:", "\naccess: {allowed_senders: [bad]}", "access.allowed_senders[0]"},
+	}
+	decodeStage := map[string]bool{"connect timeout": true, "upstream port": true, "max connections": true, "tls_options bool": true}
+	tests := []struct{ name, yaml string }{
+		{"upstream tls", "upstreams: [{name: a, host: h, tls: '${S}'}]"},
+		{"auth mechanism", "upstreams: [{name: a, host: h, auth: {username: u, password: p, mechanism: ${S}}}]"},
+		{"logging format", "upstreams: [{name: a, host: h}]\nlogging: {format: ${S}}"},
+		{"logging output", "upstreams: [{name: a, host: h}]\nlogging: {output: ${S}}"},
+		{"logging level warning", "upstreams: [{name: a, host: h}]\nlogging: {level: ${S}}"},
+		{"metrics path", "upstreams: [{name: a, host: h}]\nmetrics: {path: ${S}}"},
+		{"metrics listen", "upstreams: [{name: a, host: h}]\nmetrics: {listen: ${S}}"},
+		{"server tls profile", "upstreams: [{name: a, host: h}]\nserver: {tls: {profile: ${S}}}"},
+		{"listen address", "upstreams: [{name: a, host: h}]\nserver: {listen: [{address: ${S}}]}"},
+		{"listen tls", "upstreams: [{name: a, host: h}]\nserver: {listen: [{address: ':25', tls: ${S}}]}"},
+		{"allowed network", "upstreams: [{name: a, host: h}]\naccess: {allowed_networks: [${S}]}"},
+		{"allowed network host bits", "upstreams: [{name: a, host: h}]\nS_CIDR_PLACEHOLDER"},
+		{"allowed sender", "upstreams: [{name: a, host: h}]\naccess: {allowed_senders: [${S}]}"},
+		{"allowed sender domain", "upstreams: [{name: a, host: h}]\naccess: {allowed_sender_domains: ['@${S}']}"},
+		{"upstream name", "upstreams: [{name: '${S}', host: h}]"},
+		{"upstream host (valid, other error present)", "upstreams: [{name: a, host: ${S}}]"},
+		{"ca_file", "upstreams: [{name: a, host: h, tls_options: {ca_file: ${S}}}]"},
+		{"client cert", "upstreams: [{name: a, host: h, tls_options: {client_cert_file: ${S}, client_key_file: ${S}}}]"},
+		{"password_file", "upstreams: [{name: a, host: h, auth: {username: u, password_file: ${S}}}]"},
+		{"state file", "upstreams: [{name: a, host: h, quota: {limit: 1}}]\nstate: {file: '${S}/sub/s.json'}"},
+		{"log file path", "upstreams: [{name: a, host: h}]\nlogging: {output: file, file: {path: '${S}/sub/x.log'}}"},
+		{"connect timeout", "upstreams: [{name: a, host: h, timeouts: {connect: ${S}}}]"},
+		{"upstream port", "upstreams: [{name: a, host: h, port: ${S}}]"},
+		{"max connections", "upstreams: [{name: a, host: h}]\nserver: {limits: {max_connections: ${S}}}"},
+		{"tls_options bool", "upstreams: [{name: a, host: h, tls_options: {insecure_skip_verify: ${S}}}]"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("S", secret)
+			y := tt.yaml
+			if strings.Contains(y, "S_CIDR_PLACEHOLDER") {
+				t.Setenv("S", "10.1.2.3/8")
+				y = strings.ReplaceAll(y, "S_CIDR_PLACEHOLDER", "access: {allowed_networks: [${S}]}")
+			}
+			wantPath := ""
+			for _, o := range others {
+				if !strings.Contains(y, o.key) {
+					y += o.yaml
+					wantPath = o.path
+					break
+				}
+			}
+			_, err := load(t, y)
+			require.Error(t, err)
+			all := err.Error()
+			for _, bad := range []string{secret, "S3c", "10.1.2.3"} {
+				assert.NotContains(t, all, bad)
+			}
+			if !decodeStage[tt.name] {
+				assert.Contains(t, all, wantPath, "unrelated error must still be reported")
+			}
+		})
+	}
+}
+
+func TestValidationWarningsNeverEchoEnvDerivedValues(t *testing.T) {
+	const secret = "S3cr3t-Value-XYZ"
+	t.Setenv("S", secret)
+	cfg, err := load(t, "upstreams: [{name: a, host: h}]\nlogging: {level: '${S}'}")
+	require.NoError(t, err)
+	require.Len(t, cfg.Warnings(), 1)
+	assert.NotContains(t, cfg.Warnings()[0], "S3c")
+	assert.Contains(t, cfg.Warnings()[0], "logging.level")
+}
+
+func TestLiteralBadValuesStayHelpful(t *testing.T) {
+	tests := []struct{ yaml, want string }{
+		{"upstreams: [{name: a, host: h, tls: ssl}]", `upstreams[0].tls: must be starttls, tls or none, got "ssl"`},
+		{"upstreams: [{name: a, host: h}]\nlogging: {format: xml}", `logging.format: must be text or json, got "xml"`},
+		{"upstreams: [{name: a, host: h}]\nmetrics: {path: m}", `metrics.path: must start with /, got "m"`},
+		{"upstreams: [{name: a, host: h}]\naccess: {allowed_networks: [nope]}", `invalid CIDR, got "nope"`},
+		{"upstreams: [{name: a, host: h, port: 70000}]", "upstreams[0].port: must be between 1 and 65535, got 70000"},
+		{"upstreams: [{name: a, host: h, auth: {username: u, password: p, mechanism: x}}]", `got "x"`},
+	}
+	for _, tt := range tests {
+		_, err := load(t, tt.yaml)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), tt.want)
+	}
+}
+
+func TestUnknownKeyRepeatedOnOneLine(t *testing.T) {
+	tests := []struct{ name, yaml, want, not string }{
+		{"host inside auth",
+			"upstreams: [{auth: {username: u, password: p, host: 1}, name: a, host: h}]",
+			"upstreams[0].auth.host: unknown key", "upstreams[0].host: unknown"},
+		{"name inside quota",
+			"upstreams: [{quota: {limit: 1, name: x}, name: a, host: h}]",
+			"upstreams[0].quota.name: unknown key", "upstreams[0].name: unknown"},
+		{"top-level key repeated in nested map",
+			"{server: {upstreams: 1}, upstreams: [{name: a, host: h}]}",
+			"server.upstreams: unknown key", "\nupstreams: unknown"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := load(t, tt.yaml)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.want)
+			assert.NotContains(t, err.Error(), tt.not)
+		})
+	}
+}

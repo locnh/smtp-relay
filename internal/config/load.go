@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -25,7 +26,7 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
 
-	data, doc, err := expandEnv(raw)
+	data, doc, expanded, err := expandEnv(raw)
 	if err != nil {
 		return nil, err
 	}
@@ -44,7 +45,7 @@ func Load(path string) (*Config, error) {
 	if err := cfg.applyDefaults(present); err != nil {
 		return nil, &ValidationError{Errors: []string{"server.hostname: cannot determine system hostname: " + err.Error()}}
 	}
-	if err := cfg.validate(present); err != nil {
+	if err := cfg.validate(present, expanded); err != nil {
 		return nil, err
 	}
 	return cfg, nil
@@ -56,8 +57,10 @@ func Load(path string) (*Config, error) {
 // otherwise end the mapping). Real values are then written into the parsed
 // tree, so a secret containing YAML metacharacters can never alter the
 // document structure, and expanded values are never expanded again. Unset
-// variables are reported by name, never by value.
-func expandEnv(raw []byte) ([]byte, *yaml.Node, error) {
+// variables are reported by name, never by value. The returned set holds the
+// key paths whose value contained a substitution, so validation can avoid
+// echoing them.
+func expandEnv(raw []byte) ([]byte, *yaml.Node, map[string]bool, error) {
 	prefix := "__SMTPRELAY_ENV"
 	for bytes.Contains(raw, []byte(prefix)) {
 		prefix += "X"
@@ -71,13 +74,14 @@ func expandEnv(raw []byte) ([]byte, *yaml.Node, error) {
 
 	var doc yaml.Node
 	if err := yaml.Unmarshal(masked, &doc); err != nil {
-		return nil, nil, fmt.Errorf("parse config: %w", err)
+		return nil, nil, nil, fmt.Errorf("parse config: %w", err)
 	}
 	if doc.Kind == 0 {
-		return raw, &doc, nil
+		return raw, &doc, nil, nil
 	}
 
 	var errs []string
+	expanded := map[string]bool{}
 	walk(&doc, "", func(n *yaml.Node, path string, key bool) {
 		if n.Kind != yaml.ScalarNode || n.Tag != "!!str" || !sentinel.MatchString(n.Value) {
 			return
@@ -89,6 +93,7 @@ func expandEnv(raw []byte) ([]byte, *yaml.Node, error) {
 			return
 		}
 		whole := sentinel.FindString(n.Value) == n.Value
+		expanded[path] = true
 		n.Value = sentinel.ReplaceAllStringFunc(n.Value, func(s string) string {
 			name := names[sentinelIndex(sentinel, s)]
 			v, ok := os.LookupEnv(name)
@@ -106,14 +111,14 @@ func expandEnv(raw []byte) ([]byte, *yaml.Node, error) {
 		}
 	})
 	if len(errs) > 0 {
-		return nil, nil, &ValidationError{Errors: errs}
+		return nil, nil, nil, &ValidationError{Errors: errs}
 	}
 
 	out, err := yaml.Marshal(&doc)
 	if err != nil {
-		return nil, nil, fmt.Errorf("re-encode config: %w", err)
+		return nil, nil, nil, fmt.Errorf("re-encode config: %w", err)
 	}
-	return out, &doc, nil
+	return out, &doc, expanded, nil
 }
 
 func sentinelIndex(re *regexp.Regexp, s string) int {
@@ -201,7 +206,15 @@ func describeTypeError(msg string, byLine map[int][]located) string {
 	}
 
 	if f := unknownField.FindStringSubmatch(rest); f != nil {
-		p, ok := find(func(l located) bool { return l.key && l.node.Value == f[1] })
+		// The same key name can occur twice on one line (e.g. "host" inside
+		// auth and at upstream level); only the one whose parent struct really
+		// lacks the field can be the unknown one.
+		p, ok := find(func(l located) bool {
+			return l.key && l.node.Value == f[1] && lacksField(l.path, f[1])
+		})
+		if !ok {
+			p, ok = find(func(l located) bool { return l.key && l.node.Value == f[1] })
+		}
 		return at(p, ok, "unknown key")
 	}
 	if d := duplicateKey.FindStringSubmatch(rest); d != nil {
@@ -253,6 +266,68 @@ func expectedKind(goType string) string {
 		return "list"
 	}
 	return "mapping"
+}
+
+// lacksField reports whether the struct that holds the key at path has no YAML
+// field called name. It returns false when the parent cannot be resolved, so
+// the caller falls back to the plain name match.
+func lacksField(path, name string) bool {
+	parent := strings.TrimSuffix(path, name)
+	parent = strings.TrimSuffix(parent, ".")
+	t, ok := typeAt(reflect.TypeOf(Config{}), parent)
+	if !ok || t.Kind() != reflect.Struct {
+		return false
+	}
+	for i := 0; i < t.NumField(); i++ {
+		if strings.Split(t.Field(i).Tag.Get("yaml"), ",")[0] == name {
+			return false
+		}
+	}
+	return true
+}
+
+var pathSegment = regexp.MustCompile(`^([^\[\]]*)((?:\[\d+\])*)$`)
+
+// typeAt resolves a key path like "upstreams[0].auth" to its Go type.
+func typeAt(t reflect.Type, path string) (reflect.Type, bool) {
+	if path == "" {
+		return t, true
+	}
+	for _, seg := range strings.Split(path, ".") {
+		m := pathSegment.FindStringSubmatch(seg)
+		if m == nil {
+			return nil, false
+		}
+		for t.Kind() == reflect.Ptr {
+			t = t.Elem()
+		}
+		if t.Kind() != reflect.Struct {
+			return nil, false
+		}
+		found := false
+		for i := 0; i < t.NumField(); i++ {
+			if strings.Split(t.Field(i).Tag.Get("yaml"), ",")[0] == m[1] {
+				t, found = t.Field(i).Type, true
+				break
+			}
+		}
+		if !found {
+			return nil, false
+		}
+		for range strings.Count(m[2], "[") {
+			for t.Kind() == reflect.Ptr {
+				t = t.Elem()
+			}
+			if t.Kind() != reflect.Slice {
+				return nil, false
+			}
+			t = t.Elem()
+		}
+	}
+	for t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	return t, true
 }
 
 // walk calls fn for every node: mapping keys (key=true), scalar values and
