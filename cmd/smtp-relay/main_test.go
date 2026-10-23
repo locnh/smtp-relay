@@ -29,7 +29,8 @@ func TestRealMain(t *testing.T) {
 		{"unknown flag", []string{"-nope"}, 2, "", "flag provided but not defined"},
 		{"check ok", []string{"-config", good, "-check-config"}, 0, "config OK\n", ""},
 		{"check invalid", []string{"-config", bad, "-check-config"}, 1, "", "upstreams[0].name: must match"},
-		{"missing file", []string{"-config", filepath.Join(dir, "none.yaml"), "-check-config"}, 1, "", "read config"},
+		{"missing file", []string{"-config", filepath.Join(dir, "none.yaml"), "-check-config"}, 1, "", "smtp-relay: read config"},
+		{"extra positional arg", []string{"-config", good, "extra"}, 2, "", `unexpected argument "extra"`},
 		{"run stub", []string{"-config", good}, 1, "", "server not implemented yet (task 8)"},
 	}
 	for _, tt := range tests {
@@ -39,6 +40,9 @@ func TestRealMain(t *testing.T) {
 			assert.Equal(t, tt.wantCode, code)
 			assert.Equal(t, tt.wantStdout, out.String())
 			assert.Contains(t, errOut.String(), tt.wantStderr)
+			if tt.name == "missing file" {
+				assert.NotContains(t, errOut.String(), "invalid configuration")
+			}
 		})
 	}
 }

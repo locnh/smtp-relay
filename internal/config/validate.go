@@ -16,8 +16,9 @@ import (
 var upstreamName = regexp.MustCompile(`^[a-z0-9_-]+$`)
 
 type validator struct {
-	cfg  *Config
-	errs []string
+	cfg     *Config
+	present map[string]bool
+	errs    []string
 }
 
 func (v *validator) errf(path, format string, args ...any) {
@@ -26,8 +27,8 @@ func (v *validator) errf(path, format string, args ...any) {
 
 // validate checks the defaulted config, resolves *_file secrets, parses CIDRs
 // and records warnings. It returns a *ValidationError holding every problem.
-func (c *Config) validate() error {
-	v := &validator{cfg: c}
+func (c *Config) validate(present map[string]bool) error {
+	v := &validator{cfg: c, present: present}
 	v.server()
 	v.access()
 	v.upstreams()
@@ -207,7 +208,7 @@ func (v *validator) upstreams() {
 		if u.Host == "" {
 			v.errf(p+".host", "required")
 		}
-		if u.Port < 1 || u.Port > 65535 {
+		if u.Port < 1 || u.Port > 65535 { // an explicit "port: 0" is not defaulted, so it lands here
 			v.errf(p+".port", "must be between 1 and 65535, got %d", u.Port)
 		}
 		if !oneOf(u.TLS, "starttls", "tls", "none") {
@@ -236,6 +237,9 @@ func (v *validator) upstreamAuth(p string, u *UpstreamConfig) {
 		return
 	}
 	p += ".auth"
+	if a.Username == "" {
+		v.errf(p+".username", "required when auth is set")
+	}
 	if !oneOf(a.Mechanism, "auto", "plain", "login") {
 		v.errf(p+".mechanism", "must be auto, plain or login, got %q", a.Mechanism)
 	}
@@ -243,17 +247,40 @@ func (v *validator) upstreamAuth(p string, u *UpstreamConfig) {
 		v.errf(p, "credentials would be sent unencrypted with tls: none; use starttls/tls or set allow_insecure_auth: true")
 	}
 
+	pw, pwf := v.present[p+".password"], v.present[p+".password_file"]
 	switch {
-	case a.Password != "" && a.PasswordFile != "":
+	case pw && pwf:
 		v.errf(p+".password", "set either password or password_file, not both")
-	case a.PasswordFile != "":
+	case pwf:
+		if a.PasswordFile == "" {
+			v.errf(p+".password_file", "must not be empty")
+			break
+		}
 		b, err := os.ReadFile(a.PasswordFile)
 		if err != nil {
 			v.errf(p+".password_file", "cannot read %q: %v", a.PasswordFile, unwrapPathError(err))
 			break
 		}
-		a.Password = Secret(strings.TrimRight(string(b), "\r\n"))
+		a.Password = Secret(trimOneNewline(string(b)))
+		if a.Password == "" {
+			v.errf(p+".password_file", "%q is empty", a.PasswordFile)
+		}
+	case pw:
+		if a.Password == "" {
+			v.errf(p+".password", "must not be empty")
+		}
+	default:
+		v.errf(p+".password", "required (or set password_file)")
 	}
+}
+
+// trimOneNewline strips a single trailing "\n" or "\r\n": editors and
+// `echo` add one, but further newlines could be part of the secret.
+func trimOneNewline(s string) string {
+	if strings.HasSuffix(s, "\r\n") {
+		return s[:len(s)-2]
+	}
+	return strings.TrimSuffix(s, "\n")
 }
 
 func unwrapPathError(err error) error {

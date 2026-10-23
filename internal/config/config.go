@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"strings"
 	"time"
@@ -34,9 +35,12 @@ func defaultPort(tls string) int {
 	}
 }
 
-// applyDefaults fills unset values. A zero value means "unset", so an explicit
-// "0s" timeout or 0 limit also gets the default.
-func (c *Config) applyDefaults() error {
+// applyDefaults fills unset values. present holds the YAML key paths that
+// appeared in the file: timeouts, upstream ports and quota windows are only
+// defaulted when their key is absent, so an explicit "0s" or "port: 0" reaches
+// validation and is rejected. Other zero values (limits, rotation sizes) still
+// mean "unset"; spec 5.3 does not forbid explicit zeros for them.
+func (c *Config) applyDefaults(present map[string]bool) error {
 	s := &c.Server
 	if s.Hostname == "" {
 		h, err := os.Hostname()
@@ -56,10 +60,10 @@ func (c *Config) applyDefaults() error {
 	if s.TLS.Profile == "" {
 		s.TLS.Profile = "default"
 	}
-	setDur(&s.Timeouts.Read, 60*time.Second)
-	setDur(&s.Timeouts.Write, 60*time.Second)
-	setDur(&s.Timeouts.Data, 5*time.Minute)
-	setDur(&s.Timeouts.Shutdown, 30*time.Second)
+	setDur(&s.Timeouts.Read, 60*time.Second, present, "server.timeouts.read")
+	setDur(&s.Timeouts.Write, 60*time.Second, present, "server.timeouts.write")
+	setDur(&s.Timeouts.Data, 5*time.Minute, present, "server.timeouts.data")
+	setDur(&s.Timeouts.Shutdown, 30*time.Second, present, "server.timeouts.shutdown")
 	if s.Limits.MaxConnections == 0 {
 		s.Limits.MaxConnections = 100
 	}
@@ -80,17 +84,18 @@ func (c *Config) applyDefaults() error {
 		if u.TLS == "" {
 			u.TLS = "starttls"
 		}
-		if u.Port == 0 {
+		up := fmt.Sprintf("upstreams[%d]", i)
+		if u.Port == 0 && !present[up+".port"] {
 			u.Port = defaultPort(u.TLS)
 		}
 		if u.Auth != nil && u.Auth.Mechanism == "" {
 			u.Auth.Mechanism = "auto"
 		}
-		setDur(&u.Timeouts.Connect, 10*time.Second)
-		setDur(&u.Timeouts.Command, 30*time.Second)
-		setDur(&u.Timeouts.Data, 2*time.Minute)
+		setDur(&u.Timeouts.Connect, 10*time.Second, present, up+".timeouts.connect")
+		setDur(&u.Timeouts.Command, 30*time.Second, present, up+".timeouts.command")
+		setDur(&u.Timeouts.Data, 2*time.Minute, present, up+".timeouts.data")
 		if u.Quota != nil {
-			setDur(&u.Quota.Window, 24*time.Hour)
+			setDur(&u.Quota.Window, 24*time.Hour, present, up+".quota.window")
 		}
 	}
 
@@ -127,8 +132,8 @@ func (c *Config) applyDefaults() error {
 	return nil
 }
 
-func setDur(d *time.Duration, def time.Duration) {
-	if *d == 0 {
+func setDur(d *time.Duration, def time.Duration, present map[string]bool, path string) {
+	if *d == 0 && !present[path] {
 		*d = def
 	}
 }

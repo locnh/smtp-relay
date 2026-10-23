@@ -36,6 +36,11 @@ func realMain(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "smtp-relay/%s (%s)\n", version, buildTime)
 		return 0
 	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(stderr, "smtp-relay: unexpected argument %q\n", fs.Arg(0))
+		fs.Usage()
+		return 2
+	}
 	if *configPath == "" {
 		fmt.Fprintln(stderr, "smtp-relay: -config is required")
 		fs.Usage()
@@ -44,7 +49,12 @@ func realMain(args []string, stdout, stderr io.Writer) int {
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
-		fmt.Fprintf(stderr, "smtp-relay: invalid configuration:\n%v\n", err)
+		var ve *config.ValidationError
+		if errors.As(err, &ve) {
+			fmt.Fprintf(stderr, "smtp-relay: invalid configuration:\n%v\n", err)
+		} else {
+			fmt.Fprintf(stderr, "smtp-relay: %v\n", err)
+		}
 		return 1
 	}
 

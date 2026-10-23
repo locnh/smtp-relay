@@ -475,3 +475,259 @@ func TestSecretNeverLeaks(t *testing.T) {
 	assert.NotContains(t, string(b), secret)
 	assert.Contains(t, string(b), "***")
 }
+
+func TestErrorPathsInFlowStyle(t *testing.T) {
+	tests := []struct {
+		name string
+		yaml string
+		want string
+		not  string
+	}{
+		{"unknown key not last, level 2",
+			"access: {allowed_networks: [10.0.0.0/8], bogus: 1, allowed_senders: [x@y]}\n" + minimalUpstream,
+			"access.bogus: unknown key", "allowed_senders[0]: unknown"},
+		{"unknown key before nested map",
+			"upstreams: [{name: a, host: h, hots: [1,2], timeouts: {connect: 0s}}]",
+			"upstreams[0].hots: unknown key", "timeouts.connect: unknown"},
+		{"unknown key at level 4",
+			"upstreams: [{name: a, host: h, auth: {username: u, pasword: p, password: q}}]",
+			"upstreams[0].auth.pasword: unknown key", ""},
+		{"unknown key at top level on a one-line doc",
+			"{upstreams: [{name: a, host: h}], bogus: 1, logging: {level: info}}",
+			"bogus: unknown key", "logging"},
+		{"two unknown keys on one line",
+			"server: {aaa: 1, limits: {max_recipients: 5, zzz: 2}, bbb: 3}\n" + minimalUpstream,
+			"server.limits.zzz: unknown key", ""},
+		{"type error not last on line",
+			"upstreams: [{name: a, host: h, port: abc, tls: starttls}]",
+			"upstreams[0].port: expected integer, got string", "upstreams[0].tls"},
+		{"type error picks the value, not a neighbour",
+			"server: {limits: {max_recipients: x, max_connections: 5}}\n" + minimalUpstream,
+			"server.limits.max_recipients: expected integer, got string", "max_connections"},
+		{"bad duration",
+			"server: {timeouts: {read: soon, write: 5s}}\n" + minimalUpstream,
+			"server.timeouts.read: expected duration such as 30s, got string", "write"},
+		{"list where scalar expected",
+			"upstreams: [{name: a, host: [x], port: 25}]",
+			"upstreams[0].host: expected string, got list", ""},
+		{"duplicate key",
+			"upstreams: [{name: a, name: b, host: h}]",
+			"upstreams[0].name: duplicate key", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := load(t, tt.yaml)
+			require.Error(t, err)
+			errs := validationErrors(t, err)
+			assert.True(t, anyContains(errs, tt.want), "want %q in %q", tt.want, errs)
+			if tt.not != "" {
+				assert.False(t, anyContains(errs, tt.not), "unexpected %q in %q", tt.not, errs)
+			}
+		})
+	}
+}
+
+func TestTypeErrorsNeverEchoValues(t *testing.T) {
+	const secret = "hunter2-very-secret"
+	t.Setenv("LEAKY", secret)
+	for _, y := range []string{
+		"upstreams: [{name: a, host: h, port: ${LEAKY}}]",
+		"upstreams: [{name: a, host: h, tls_options: {insecure_skip_verify: ${LEAKY}}}]",
+		"server: {timeouts: {read: ${LEAKY}}}\n" + minimalUpstream,
+		"server: {limits: {max_message_size: \"${LEAKY}\"}}\n" + minimalUpstream,
+		"upstreams:\n  - name: a\n    host: h\n    port: ${LEAKY}\n",
+		"upstreams:\n  - name: a\n    host: h\n    port: short-secret\n",
+	} {
+		_, err := load(t, y)
+		require.Error(t, err, y)
+		assert.NotContains(t, err.Error(), secret)
+		assert.NotContains(t, err.Error(), secret[:7])
+		assert.NotContains(t, err.Error(), "short-secret")
+	}
+}
+
+func TestEnvExpansionFlowAndQuoting(t *testing.T) {
+	t.Setenv("SMTP2GO_USER", "s2g-user")
+	t.Setenv("SMTP2GO_PASS", "s2g-pass")
+	t.Setenv("REGION", "eu-west-1")
+
+	t.Run("spec 5.2 flow style, unquoted", func(t *testing.T) {
+		cfg := mustLoad(t, `
+upstreams:
+  - name: smtp2go
+    host: mail.smtp2go.com
+    port: 2525
+    auth: { username: ${SMTP2GO_USER}, password: ${SMTP2GO_PASS} }
+`)
+		a := cfg.Upstreams[0].Auth
+		assert.Equal(t, "s2g-user", a.Username)
+		assert.Equal(t, "s2g-pass", a.Password.Reveal())
+	})
+
+	t.Run("block style", func(t *testing.T) {
+		cfg := mustLoad(t, "upstreams:\n  - name: a\n    host: h\n    auth:\n      username: ${SMTP2GO_USER}\n      password: ${SMTP2GO_PASS}\n")
+		assert.Equal(t, "s2g-pass", cfg.Upstreams[0].Auth.Password.Reveal())
+	})
+
+	t.Run("quoted", func(t *testing.T) {
+		cfg := mustLoad(t, `
+upstreams:
+  - name: a
+    host: "${REGION}.double"
+    auth: {username: '${SMTP2GO_USER}', password: "${SMTP2GO_PASS}"}
+`)
+		u := cfg.Upstreams[0]
+		assert.Equal(t, "eu-west-1.double", u.Host)
+		assert.Equal(t, "s2g-user", u.Auth.Username)
+		assert.Equal(t, "s2g-pass", u.Auth.Password.Reveal())
+	})
+
+	t.Run("embedded in a longer string, flow and block", func(t *testing.T) {
+		cfg := mustLoad(t, "upstreams:\n  - {name: a, host: smtp.${REGION}.example.com}\n  - name: b\n    host: smtp.${REGION}.example.com\n")
+		assert.Equal(t, "smtp.eu-west-1.example.com", cfg.Upstreams[0].Host)
+		assert.Equal(t, "smtp.eu-west-1.example.com", cfg.Upstreams[1].Host)
+	})
+
+	t.Run("two references in one scalar", func(t *testing.T) {
+		cfg := mustLoad(t, "server: {welcome_message: ${REGION}-${SMTP2GO_USER}}\n"+minimalUpstream)
+		assert.Equal(t, "eu-west-1-s2g-user", cfg.Server.WelcomeMessage)
+	})
+
+	t.Run("unset in flow style names the variable only", func(t *testing.T) {
+		t.Setenv("GONE", "x")
+		require.NoError(t, os.Unsetenv("GONE"))
+		_, err := load(t, "upstreams:\n  - {name: a, host: h, auth: {username: ${GONE}, password: p}}\n")
+		errs := validationErrors(t, err)
+		require.Len(t, errs, 1)
+		assert.Equal(t, "upstreams[0].auth.username: environment variable GONE is not set", errs[0])
+	})
+
+	t.Run("not expanded in keys or comments", func(t *testing.T) {
+		_, err := load(t, "# ${NOT_SET_COMMENT}\nupstreams: [{name: a, host: h}] # ${NOT_SET_TRAILING}\n${KEY_VAR}: 1\n")
+		errs := validationErrors(t, err)
+		require.Len(t, errs, 1)
+		assert.Contains(t, errs[0], "unknown key")
+	})
+}
+
+func TestEnvValuesStayPlainStrings(t *testing.T) {
+	tests := []struct{ name, value string }{
+		{"colon and hash", `p@ss: "x" #y`},
+		{"newline", "line1\nline2: x"},
+		{"null", "null"},
+		{"true", "true"},
+		{"number", "12345"},
+		{"flow map", "{a: b}"},
+		{"flow list", "[a, b]"},
+		{"anchor and tag", "&a !!int 5"},
+		{"quotes", `it's "quoted"`},
+		{"dollar refs", "${OTHER} $OTHER"},
+		{"sentinel look-alike", "__SMTPRELAY_ENV_0__"},
+		{"sentinel look-alike 2", "__SMTPRELAY_ENV_1__ and __SMTPRELAY_ENV_0__"},
+		{"leading dash", "- item"},
+		{"document marker", "---\nfoo: bar"},
+	}
+	for _, tt := range tests {
+		for _, form := range []string{
+			"upstreams: [{name: a, host: h, auth: {username: u, password: %s}}]",
+			"upstreams: [{name: a, host: h, auth: {username: u, password: '%s'}}]",
+			"upstreams:\n  - name: a\n    host: h\n    auth:\n      username: u\n      password: %s\n",
+			"upstreams:\n  - name: a\n    host: h\n    auth:\n      username: u\n      password: \"%s\"\n",
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				t.Setenv("OTHER", "other-value")
+				t.Setenv("VAL", tt.value)
+				y := fmt.Sprintf(form, "${VAL}")
+				cfg, err := load(t, y)
+				require.NoError(t, err, y)
+				require.Len(t, cfg.Upstreams, 1)
+				assert.Equal(t, tt.value, cfg.Upstreams[0].Auth.Password.Reveal())
+				assert.Equal(t, "u", cfg.Upstreams[0].Auth.Username)
+				assert.Equal(t, "h", cfg.Upstreams[0].Host)
+			})
+		}
+	}
+}
+
+func TestEnvUnsetErrorNeverContainsOtherValues(t *testing.T) {
+	const secret = "top-secret-value"
+	t.Setenv("HAVE", secret)
+	t.Setenv("MISSING_X", "x")
+	require.NoError(t, os.Unsetenv("MISSING_X"))
+	_, err := load(t, "upstreams: [{name: a, host: h, auth: {username: ${HAVE}, password: ${MISSING_X}}}]")
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), secret)
+	assert.Contains(t, err.Error(), "MISSING_X")
+}
+
+func TestExplicitZeroValuesRejected(t *testing.T) {
+	tests := []struct{ name, yaml, want string }{
+		{"server read 0s", "server: {timeouts: {read: 0s}}\n" + minimalUpstream, "server.timeouts.read: must be at least 1s"},
+		{"server shutdown 0", "server: {timeouts: {shutdown: 0s}}\n" + minimalUpstream, "server.timeouts.shutdown: must be at least 1s"},
+		{"upstream connect 0s", "upstreams: [{name: a, host: h, timeouts: {connect: 0s}}]", "upstreams[0].timeouts.connect: must be at least 1s"},
+		{"upstream port 0", "upstreams: [{name: a, host: h, port: 0}]", "upstreams[0].port: must be between"},
+		{"quota window 0s", "upstreams: [{name: a, host: h, quota: {limit: 5, window: 0s}}]\nstate: {file: /tmp/x/s.json}", "upstreams[0].quota.window: must be at least 1m0s"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := load(t, tt.yaml)
+			require.Error(t, err)
+			assert.True(t, anyContains(validationErrors(t, err), tt.want), "got %v", err)
+		})
+	}
+}
+
+func TestAuthRules(t *testing.T) {
+	dir := t.TempDir()
+	empty := writeFile(t, dir, "empty", "\n")
+	tests := []struct{ name, yaml, want string }{
+		{"empty username", "upstreams: [{name: a, host: h, auth: {username: '', password: p}}]", "upstreams[0].auth.username: required"},
+		{"no username key", "upstreams: [{name: a, host: h, auth: {password: p}}]", "upstreams[0].auth.username: required"},
+		{"no password at all", "upstreams: [{name: a, host: h, auth: {username: u}}]", "upstreams[0].auth.password: required"},
+		{"empty password", "upstreams: [{name: a, host: h, auth: {username: u, password: ''}}]", "upstreams[0].auth.password: must not be empty"},
+		{"both set, password empty", fmt.Sprintf("upstreams: [{name: a, host: h, auth: {username: u, password: '', password_file: %s}}]", empty), "upstreams[0].auth.password: set either"},
+		{"empty password_file contents", fmt.Sprintf("upstreams: [{name: a, host: h, auth: {username: u, password_file: %s}}]", empty), "upstreams[0].auth.password_file:"},
+		{"empty password_file path", "upstreams: [{name: a, host: h, auth: {username: u, password_file: ''}}]", "upstreams[0].auth.password_file: must not be empty"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := load(t, tt.yaml)
+			require.Error(t, err)
+			assert.True(t, anyContains(validationErrors(t, err), tt.want), "got %v", err)
+		})
+	}
+}
+
+func TestPasswordFileTrimsOnlyOneNewline(t *testing.T) {
+	tests := []struct{ content, want string }{
+		{"s\n", "s"},
+		{"s\r\n", "s"},
+		{"s\n\n", "s\n"},
+		{"s\r\n\r\n", "s\r\n"},
+		{"s\r", "s\r"},
+	}
+	for _, tt := range tests {
+		pw := writeFile(t, t.TempDir(), "pw", tt.content)
+		cfg := mustLoad(t, fmt.Sprintf("upstreams: [{name: a, host: h, auth: {username: u, password_file: %s}}]", pw))
+		assert.Equal(t, tt.want, cfg.Upstreams[0].Auth.Password.Reveal(), "content %q", tt.content)
+	}
+}
+
+func TestSenderDomainAndTLSFileRules(t *testing.T) {
+	dir := t.TempDir()
+	certPath, _ := writeCert(t, dir, "srv")
+	tests := []struct{ name, yaml, want string }{
+		{"domain with LF", "access: {allowed_sender_domains: [\"example.com\\nX: y\"]}\n" + minimalUpstream, "access.allowed_sender_domains[0]: must not contain CR or LF"},
+		{"domain with CR", "access: {allowed_sender_domains: [\"example.com\\r\"]}\n" + minimalUpstream, "access.allowed_sender_domains[0]: must not contain CR or LF"},
+		{"empty domain", "access: {allowed_sender_domains: ['']}\n" + minimalUpstream, "access.allowed_sender_domains[0]: must be a non-empty domain"},
+		{"cert without key (starttls)", fmt.Sprintf("server: {listen: [{address: ':587', tls: starttls}], tls: {cert_file: %s}}\n%s", certPath, minimalUpstream), "server.tls.key_file: must be set together with cert_file"},
+		{"key without cert", fmt.Sprintf("server: {listen: [{address: ':587', tls: starttls}], tls: {key_file: %s}}\n%s", certPath, minimalUpstream), "server.tls.cert_file: must be set together with key_file"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := load(t, tt.yaml)
+			require.Error(t, err)
+			assert.True(t, anyContains(validationErrors(t, err), tt.want), "got %v", err)
+		})
+	}
+}
