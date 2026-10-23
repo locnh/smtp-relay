@@ -73,6 +73,9 @@ func (c *Config) applyDefaults(present map[string]bool) error {
 	if s.Limits.MaxRecipients == 0 {
 		s.Limits.MaxRecipients = 100
 	}
+	if s.Limits.MaxLineLength == 0 {
+		s.Limits.MaxLineLength = 1 << 20
+	}
 
 	// nil means the key was absent; an explicit empty list is kept (open relay).
 	if c.Access.AllowedNetworks == nil {

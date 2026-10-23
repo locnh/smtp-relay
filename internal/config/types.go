@@ -59,6 +59,8 @@ type ServerLimits struct {
 	MaxConnections int   `yaml:"max_connections"`
 	MaxMessageSize int64 `yaml:"max_message_size"`
 	MaxRecipients  int   `yaml:"max_recipients"`
+	// MaxLineLength bounds one protocol line (command or DATA line) in bytes.
+	MaxLineLength int `yaml:"max_line_length"`
 }
 
 // AccessConfig is the only access gate (clients are not authenticated).

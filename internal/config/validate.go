@@ -144,6 +144,10 @@ func (v *validator) server() {
 	if s.Limits.MaxRecipients < 0 {
 		v.errf("server.limits.max_recipients", "must be positive%s", v.got("server.limits.max_recipients", s.Limits.MaxRecipients))
 	}
+	// 1000 is the RFC 5321 minimum text line length (with CRLF).
+	if s.Limits.MaxLineLength < 1000 {
+		v.errf("server.limits.max_line_length", "must be at least 1000%s", v.got("server.limits.max_line_length", s.Limits.MaxLineLength))
+	}
 }
 
 // keyPair checks a cert/key pair. When required is false, setting neither is fine.

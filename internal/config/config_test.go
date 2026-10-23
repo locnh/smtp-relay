@@ -129,6 +129,7 @@ func TestDefaults(t *testing.T) {
 	assert.Equal(t, 100, cfg.Server.Limits.MaxConnections)
 	assert.Equal(t, int64(10240000), cfg.Server.Limits.MaxMessageSize)
 	assert.Equal(t, 100, cfg.Server.Limits.MaxRecipients)
+	assert.Equal(t, 1048576, cfg.Server.Limits.MaxLineLength)
 
 	u := cfg.Upstreams[0]
 	assert.Equal(t, "starttls", u.TLS)
@@ -174,7 +175,7 @@ func TestExplicitValuesKept(t *testing.T) {
 	cfg := mustLoad(t, fmt.Sprintf(`
 server:
   hostname: relay.lan
-  limits: {max_connections: -1}
+  limits: {max_connections: -1, max_line_length: 4096}
   timeouts: {read: 5s}
 upstreams:
   - name: a
@@ -187,6 +188,7 @@ logging: {level: debug, format: json, output: stderr, file: {compress: false}}
 `, filepath.Join(dir, "s.json")))
 	assert.Equal(t, "relay.lan", cfg.Server.Hostname)
 	assert.Equal(t, -1, cfg.Server.Limits.MaxConnections)
+	assert.Equal(t, 4096, cfg.Server.Limits.MaxLineLength)
 	assert.Equal(t, 5*time.Second, cfg.Server.Timeouts.Read)
 	assert.Equal(t, "login", cfg.Upstreams[0].Auth.Mechanism)
 	assert.Equal(t, 24*time.Hour, cfg.Upstreams[0].Quota.Window)
@@ -266,6 +268,8 @@ func TestValidationRules(t *testing.T) {
 		{"server timeout negative", "server: {timeouts: {data: -5s}}\n" + minimalUpstream, "server.timeouts.data: must be at least 1s"},
 		{"upstream timeout too small", "upstreams: [{name: a, host: h, timeouts: {connect: 999ms}}]", "upstreams[0].timeouts.connect: must be at least 1s"},
 		{"max_connections invalid", "server: {limits: {max_connections: -2}}\n" + minimalUpstream, "server.limits.max_connections"},
+		{"max_line_length below RFC minimum", "server: {limits: {max_line_length: 999}}\n" + minimalUpstream, "server.limits.max_line_length: must be at least 1000, got 999"},
+		{"max_line_length negative", "server: {limits: {max_line_length: -1}}\n" + minimalUpstream, "server.limits.max_line_length: must be at least 1000"},
 		{"client cert without key", fmt.Sprintf("upstreams: [{name: a, host: h, tls_options: {client_cert_file: %s}}]", clientCert), "upstreams[0].tls_options.client_key_file: must be set together"},
 		{"client key without cert", fmt.Sprintf("upstreams: [{name: a, host: h, tls_options: {client_key_file: %s}}]", clientKey), "upstreams[0].tls_options.client_cert_file: must be set together"},
 		{"client keypair unreadable", "upstreams: [{name: a, host: h, tls_options: {client_cert_file: /no/cert, client_key_file: /no/key}}]", "upstreams[0].tls_options: cannot load key pair"},
@@ -1033,4 +1037,10 @@ func TestMergeBombIsBounded(t *testing.T) {
 	_, err := load(t, b.String())
 	require.Error(t, err)
 	assert.Less(t, time.Since(start), 5*time.Second)
+}
+
+func TestMaxLineLengthBoundaryAndZeroFallsBack(t *testing.T) {
+	assert.Equal(t, 1000, mustLoad(t, "server: {limits: {max_line_length: 1000}}\n"+minimalUpstream).Server.Limits.MaxLineLength)
+	// Like the other limits.* keys, an explicit 0 means "use the default".
+	assert.Equal(t, 1048576, mustLoad(t, "server: {limits: {max_line_length: 0}}\n"+minimalUpstream).Server.Limits.MaxLineLength)
 }
