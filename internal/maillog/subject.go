@@ -14,6 +14,8 @@ const (
 	maxHeaderBytes = 64 << 10
 	maxSubjectLen  = 200
 	ellipsis       = "…"
+	zwj            = '\u200d'
+	zwnj           = '\u200c'
 )
 
 // Subject returns the decoded, sanitised Subject of a raw message (headers+body as received).
@@ -23,6 +25,10 @@ func Subject(data []byte) string {
 	if !ok {
 		return ""
 	}
+	// DecodeHeader fails the whole value when any encoded word has an
+	// unsupported charset or bad encoding. Keeping the raw text is deliberate:
+	// spec 7.2 says "parse error => empty", but the raw encoded words are more
+	// useful to an operator than a blank subject and are still sanitised below.
 	decoded, err := new(mime.WordDecoder).DecodeHeader(raw)
 	if err != nil {
 		decoded = raw
@@ -31,10 +37,16 @@ func Subject(data []byte) string {
 }
 
 // Sanitize removes control characters (incl. CR, LF, TAB, DEL, C1 range) so a value cannot forge log lines.
-// Each one is replaced by a single space; invalid UTF-8 becomes U+FFFD.
+// Unicode format characters (category Cf: bidi overrides/isolates, zero-width space,
+// word joiner, BOM, ...) are replaced as well, to stop Trojan-Source style log forging.
+// ZWJ and ZWNJ are kept so emoji sequences and Indic/Persian text survive.
+// Each replaced rune becomes a single space; invalid UTF-8 becomes U+FFFD.
 func Sanitize(s string) string {
 	return strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) || r == '\u2028' || r == '\u2029' {
+		switch {
+		case r == zwj || r == zwnj:
+			return r
+		case unicode.IsControl(r), unicode.Is(unicode.Cf, r), r == '\u2028', r == '\u2029':
 			return ' '
 		}
 		return r

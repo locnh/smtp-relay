@@ -8,11 +8,14 @@ import (
 
 const maxRecipients = 10
 
+// Status is the final outcome of a mail.
 type Status string
 
 const (
+	// StatusDelivered means an upstream accepted the mail.
 	StatusDelivered Status = "delivered"
-	StatusFailed    Status = "failed"
+	// StatusFailed means no upstream accepted the mail.
+	StatusFailed Status = "failed"
 )
 
 // Summary describes the outcome of one mail whose DATA was fully received.
@@ -31,11 +34,16 @@ type Summary struct {
 }
 
 // Log writes exactly one line for the summary: info when delivered, error when failed.
+// Any status other than StatusDelivered is logged as failed (fail-visible).
+// upstream is only logged when delivered and error only when failed.
 // Every free-form value is sanitised so it cannot forge additional log lines.
 func Log(l zerolog.Logger, s Summary) {
-	ev := l.Info()
-	if s.Status == StatusFailed {
-		ev = l.Error()
+	delivered := s.Status == StatusDelivered
+	status := StatusFailed
+	ev := l.Error()
+	if delivered {
+		status = StatusDelivered
+		ev = l.Info()
 	}
 
 	to := s.To
@@ -52,8 +60,8 @@ func Log(l zerolog.Logger, s Summary) {
 		ev = ev.Int("rcpt_count", len(s.To))
 	}
 	ev = ev.Str("subj", truncate(Sanitize(s.Subject), maxSubjectLen)).
-		Str("status", string(s.Status))
-	if s.Upstream != "" {
+		Str("status", string(status))
+	if delivered && s.Upstream != "" {
 		ev = ev.Str("upstream", Sanitize(s.Upstream))
 	}
 	ev = ev.Int("attempts", s.Attempts).
@@ -61,7 +69,7 @@ func Log(l zerolog.Logger, s Summary) {
 		Int64("duration_ms", s.Duration.Milliseconds()).
 		Str("peer", Sanitize(s.Peer)).
 		Str("uuid", Sanitize(s.ID))
-	if s.Err != nil {
+	if !delivered && s.Err != nil {
 		ev = ev.Str("error", Sanitize(s.Err.Error()))
 	}
 	ev.Msg("mail")

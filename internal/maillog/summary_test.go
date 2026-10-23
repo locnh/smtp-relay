@@ -179,3 +179,78 @@ func TestLogConsoleWriterSingleLine(t *testing.T) {
 		})
 	}
 }
+
+func TestLogFieldsTiedToStatus(t *testing.T) {
+	boom := errors.New("boom")
+	tests := []struct {
+		name         string
+		mod          func(*Summary)
+		wantLevel    string
+		wantStatus   string
+		wantUpstream bool
+		wantError    bool
+	}{
+		{"delivered with upstream", func(*Summary) {}, "info", "delivered", true, false},
+		{"delivered with stray Err", func(s *Summary) { s.Err = boom }, "info", "delivered", true, false},
+		{"failed with Err", func(s *Summary) { s.Status, s.Upstream, s.Err = StatusFailed, "", boom }, "error", "failed", false, true},
+		{"failed with stray upstream", func(s *Summary) { s.Status, s.Err = StatusFailed, boom }, "error", "failed", false, true},
+		{"failed without Err", func(s *Summary) { s.Status, s.Upstream = StatusFailed, "" }, "error", "failed", false, false},
+		{"empty status is failed", func(s *Summary) { s.Status, s.Err = "", boom }, "error", "failed", false, true},
+		{"unknown status is failed", func(s *Summary) { s.Status = "weird" }, "error", "failed", false, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := baseSummary()
+			tt.mod(&s)
+			m, _ := logJSON(t, s)
+			assert.Equal(t, tt.wantLevel, m["level"])
+			assert.Equal(t, tt.wantStatus, m["status"])
+			if tt.wantUpstream {
+				assert.Equal(t, "ses-eu", m["upstream"])
+			} else {
+				assert.NotContains(t, m, "upstream")
+			}
+			if tt.wantError {
+				assert.Equal(t, "boom", m["error"])
+			} else {
+				assert.NotContains(t, m, "error")
+			}
+		})
+	}
+}
+
+func TestLogStripsBidiChars(t *testing.T) {
+	s := baseSummary()
+	s.Status = StatusFailed
+	s.From = "a\u202e@b"
+	s.To = []string{"x\u2066@y"}
+	s.Subject = "s\u202eubj\u2066"
+	s.Peer = "1.2.3.4\u202e"
+	s.Err = errors.New("e\u202erro\u2066r")
+	m, out := logJSON(t, s)
+	assert.Equal(t, "a @b", m["from"])
+	assert.Equal(t, []any{"x @y"}, m["to"])
+	assert.Equal(t, "s ubj ", m["subj"])
+	assert.Equal(t, "1.2.3.4 ", m["peer"])
+	assert.Equal(t, "e rro r", m["error"])
+	assert.NotContains(t, out, "\u202e")
+	assert.NotContains(t, out, "\u2066")
+}
+
+func TestLogConsoleWriterBidi(t *testing.T) {
+	var buf bytes.Buffer
+	l := zerolog.New(zerolog.ConsoleWriter{Out: &buf, NoColor: true, TimeFormat: time.RFC3339})
+	s := baseSummary()
+	s.Subject = "innocent\u202e\r\nINF mail from=evil"
+	Log(l, s)
+	out := buf.String()
+	assert.Equal(t, 1, strings.Count(out, "\n"), out)
+	assert.NotContains(t, out, "\u202e")
+}
+
+func TestLogKeepsZWJ(t *testing.T) {
+	s := baseSummary()
+	s.Subject = "👨\u200d👩\u200d👧"
+	m, _ := logJSON(t, s)
+	assert.Equal(t, "👨\u200d👩\u200d👧", m["subj"])
+}

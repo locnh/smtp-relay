@@ -123,3 +123,34 @@ func FuzzSubject(f *testing.F) {
 		}
 	})
 }
+
+func TestSubjectKeepsRawWhenAnyWordUndecodable(t *testing.T) {
+	// mime.WordDecoder fails the whole header if one word is undecodable, so
+	// even the valid word stays encoded. Deliberate, see Subject.
+	data := "Subject: =?UTF-8?B?SGk=?= =?X-UNKNOWN-9?Q?abc?=\r\n\r\n"
+	assert.Equal(t, "=?UTF-8?B?SGk=?= =?X-UNKNOWN-9?Q?abc?=", Subject([]byte(data)))
+}
+
+func TestSanitizeFormatChars(t *testing.T) {
+	tests := []struct{ name, in, want string }{
+		{"rlo", "a\u202eb", "a b"},
+		{"bidi embeddings", "\u202a\u202b\u202c\u202d\u202e", "     "},
+		{"bidi isolates", "x\u2066y\u2067\u2068\u2069", "x y   "},
+		{"zero width space", "a\u200bb", "a b"},
+		{"word joiner", "a\u2060b", "a b"},
+		{"bom", "\ufeffa", " a"},
+		{"lrm rlm", "a\u200e\u200fb", "a  b"},
+		{"zwj kept", "a\u200db", "a\u200db"},
+		{"zwnj kept", "a\u200cb", "a\u200cb"},
+		{"emoji family kept", "👨\u200d👩\u200d👧", "👨\u200d👩\u200d👧"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) { assert.Equal(t, tt.want, Sanitize(tt.in)) })
+	}
+}
+
+func TestSubjectFormatChars(t *testing.T) {
+	assert.Equal(t, "evil  txt", Subject([]byte("Subject: evil\u202e txt\r\n\r\n")))
+	assert.Equal(t, "👨\u200d👩\u200d👧 family", Subject([]byte("Subject: 👨\u200d👩\u200d👧 family\r\n\r\n")))
+	assert.Equal(t, "a b", Subject([]byte("Subject: a\u200bb\r\n\r\n")))
+}
