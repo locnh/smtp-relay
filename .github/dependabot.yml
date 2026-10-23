@@ -10,7 +10,15 @@ updates:
     schedule:
       interval: weekly
 
+  # Dependabot cannot bump the Dockerfile's ARG-interpolated FROM tags (GO_VERSION,
+  # ALPINE_VERSION), so base-image bumps must be done manually. This entry covers
+  # any literal image references that are not interpolated.
   - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: docker-compose
     directory: /
     schedule:
       interval: weekly

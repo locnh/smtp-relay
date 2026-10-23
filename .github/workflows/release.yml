@@ -5,13 +5,33 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./... -race -count=1
+
   binaries:
     name: Build ${{ matrix.goarch }}
+    needs: verify
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       matrix:
         goos: [linux]
@@ -23,6 +43,8 @@ jobs:
       CGO_ENABLED: "0"
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-go@v7
         with:
@@ -51,6 +73,11 @@ jobs:
     name: GitHub release
     needs: binaries
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/download-artifact@v8
         with:
@@ -63,15 +90,25 @@ jobs:
         run: sha256sum *.tar.gz > SHA256SUMS
 
       - name: Create release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --generate-notes dist/*
+        run: |
+          flags=()
+          if [[ ! "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --generate-notes "${flags[@]}" dist/*
 
   image:
     name: Container image
+    needs: verify
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - uses: docker/setup-qemu-action@v4
 
@@ -83,9 +120,23 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set build time
+      - name: Compute image tags
         id: meta
-        run: echo "build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          # Docker tags cannot contain '+', so semver build metadata is mapped to '-'.
+          tags="${image}:${VERSION//+/-}"
+          if [[ "${VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            tags="${tags}"$'\n'"${image}:latest"
+          fi
+          {
+            echo "tags<<EOF"
+            echo "${tags}"
+            echo "EOF"
+            echo "build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } >> "${GITHUB_OUTPUT}"
 
       - name: Build and push image
         uses: docker/build-push-action@v7
@@ -94,11 +145,9 @@ jobs:
           file: Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: |
-            ghcr.io/locnh/smtp-relay:${{ github.ref_name }}
-            ghcr.io/locnh/smtp-relay:latest
+          tags: ${{ steps.meta.outputs.tags }}
           build-args: |
             VERSION=${{ github.ref_name }}
             BUILD_TIME=${{ steps.meta.outputs.build_time }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=release-image
+          cache-to: type=gha,mode=max,scope=release-image
