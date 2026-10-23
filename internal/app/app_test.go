@@ -3,10 +3,18 @@ package app
 import (
 	"bufio"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/smtp"
@@ -35,8 +43,14 @@ type fakeUpstream struct {
 	release  chan struct{} // when non-nil, end-of-DATA reply waits for it
 	once     sync.Once
 
-	mu    sync.Mutex
-	mails []recorded
+	tlsCfg   *tls.Config // non-nil: offer STARTTLS (or implicit TLS when implicit is set)
+	implicit bool
+
+	mu       sync.Mutex
+	mails    []recorded
+	authTLS  []bool // one entry per AUTH seen: was the connection encrypted
+	sawMail  bool
+	sawStart bool
 }
 
 type recorded struct {
@@ -47,9 +61,14 @@ type recorded struct {
 
 func startFakeUpstream(t *testing.T, user, pass, dataReply string) *fakeUpstream {
 	t.Helper()
+	return startFakeUpstreamTLS(t, user, pass, dataReply, nil, false)
+}
+
+func startFakeUpstreamTLS(t *testing.T, user, pass, dataReply string, tlsCfg *tls.Config, implicit bool) *fakeUpstream {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
-	f := &fakeUpstream{ln: ln, user: user, pass: pass, dataCode: dataReply}
+	f := &fakeUpstream{ln: ln, user: user, pass: pass, dataCode: dataReply, tlsCfg: tlsCfg, implicit: implicit}
 	if f.dataCode == "" {
 		f.dataCode = "250 queued"
 	}
@@ -83,8 +102,12 @@ func addrOf(line string) string {
 }
 
 func (f *fakeUpstream) serve(c net.Conn) {
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+	encrypted := false
+	if f.tlsCfg != nil && f.implicit {
+		c, encrypted = tls.Server(c, f.tlsCfg), true
+	}
 	r := bufio.NewReader(c)
 	send := func(s string) { _, _ = io.WriteString(c, s+"\r\n") }
 	send("220 fake ESMTP")
@@ -98,13 +121,39 @@ func (f *fakeUpstream) serve(c net.Conn) {
 		verb := strings.ToUpper(line)
 		switch {
 		case strings.HasPrefix(verb, "EHLO"), strings.HasPrefix(verb, "HELO"):
-			if f.user != "" {
+			var ext []string
+			if f.tlsCfg != nil && !f.implicit && !encrypted {
+				ext = append(ext, "STARTTLS")
+			}
+			// With TLS configured, AUTH is only offered once the link is encrypted.
+			if f.user != "" && (f.tlsCfg == nil || encrypted) {
+				ext = append(ext, "AUTH PLAIN")
+			}
+			// The first line is the greeting; clients skip it when reading extensions.
+			if len(ext) > 0 {
 				send("250-fake")
-				send("250 AUTH PLAIN")
-			} else {
+			}
+			for i, e := range ext {
+				sep := "-"
+				if i == len(ext)-1 {
+					sep = " "
+				}
+				send("250" + sep + e)
+			}
+			if len(ext) == 0 {
 				send("250 fake")
 			}
+		case verb == "STARTTLS" && f.tlsCfg != nil && !encrypted:
+			f.mu.Lock()
+			f.sawStart = true
+			f.mu.Unlock()
+			send("220 go ahead")
+			c, encrypted = tls.Server(c, f.tlsCfg), true
+			r = bufio.NewReader(c)
 		case strings.HasPrefix(verb, "AUTH PLAIN "):
+			f.mu.Lock()
+			f.authTLS = append(f.authTLS, encrypted)
+			f.mu.Unlock()
 			raw, _ := base64.StdEncoding.DecodeString(line[len("AUTH PLAIN "):])
 			if string(raw) == "\x00"+f.user+"\x00"+f.pass {
 				send("235 2.7.0 ok")
@@ -112,6 +161,9 @@ func (f *fakeUpstream) serve(c net.Conn) {
 				send("535 5.7.8 bad credentials")
 			}
 		case strings.HasPrefix(verb, "MAIL FROM:"):
+			f.mu.Lock()
+			f.sawMail = true
+			f.mu.Unlock()
 			cur = recorded{from: addrOf(line)}
 			send("250 ok")
 		case strings.HasPrefix(verb, "RCPT TO:"):
@@ -150,6 +202,60 @@ func (f *fakeUpstream) serve(c net.Conn) {
 	}
 }
 
+type testCA struct {
+	cert *x509.Certificate
+	key  *ecdsa.PrivateKey
+}
+
+func newTestCA(t *testing.T, name string) *testCA {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(time.Now().UnixNano()),
+		Subject:               pkix.Name{CommonName: name},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	require.NoError(t, err)
+	cert, err := x509.ParseCertificate(der)
+	require.NoError(t, err)
+	return &testCA{cert: cert, key: key}
+}
+
+// writePEM stores the CA certificate and returns its path (for tls_options.ca_file).
+func (ca *testCA) writePEM(t *testing.T) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "ca.pem")
+	data := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: ca.cert.Raw})
+	require.NoError(t, os.WriteFile(p, data, 0o600))
+	return p
+}
+
+// serverTLS returns a TLS config whose certificate is valid for 127.0.0.1 and localhost.
+func (ca *testCA) serverTLS(t *testing.T) *tls.Config {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().UnixNano()),
+		Subject:      pkix.Name{CommonName: "fake-upstream"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+		DNSNames:     []string{"localhost"},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca.cert, &key.PublicKey, ca.key)
+	require.NoError(t, err)
+	return &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}}}
+}
+
 // closedPort returns a TCP port nothing listens on.
 func closedPort(t *testing.T) int {
 	t.Helper()
@@ -165,7 +271,9 @@ type upSpec struct {
 	port  int
 	user  string
 	pass  string
-	quota int // 0 = none
+	quota int    // 0 = none
+	tls   string // none (default) | starttls | tls
+	ca    string // tls_options.ca_file
 }
 
 type cfgSpec struct {
@@ -197,9 +305,15 @@ func (s cfgSpec) yaml() string {
 	}
 	b.WriteString("upstreams:\n")
 	for _, u := range s.upstreams {
-		fmt.Fprintf(&b, "  - name: %s\n    host: 127.0.0.1\n    port: %d\n    tls: none\n    timeouts: {connect: 2s, command: 5s, data: 5s}\n", u.name, u.port)
+		if u.tls == "" {
+			u.tls = "none"
+		}
+		fmt.Fprintf(&b, "  - name: %s\n    host: 127.0.0.1\n    port: %d\n    tls: %s\n    timeouts: {connect: 2s, command: 5s, data: 5s}\n", u.name, u.port, u.tls)
+		if u.ca != "" {
+			fmt.Fprintf(&b, "    tls_options: {ca_file: %s}\n", u.ca)
+		}
 		if u.user != "" {
-			fmt.Fprintf(&b, "    auth: {username: %s, password: %s, allow_insecure_auth: true}\n", u.user, u.pass)
+			fmt.Fprintf(&b, "    auth: {username: %s, password: %s, allow_insecure_auth: %t}\n", u.user, u.pass, u.tls == "none")
 		}
 		if u.quota > 0 {
 			fmt.Fprintf(&b, "    quota: {limit: %d, window: 24h}\n", u.quota)
@@ -381,7 +495,8 @@ func TestEndToEndFailover(t *testing.T) {
 	second := startFakeUpstream(t, "", "", "")
 	logPath := filepath.Join(t.TempDir(), "logs", "relay.log")
 	h := start(t, cfgSpec{
-		upstreams: []upSpec{{name: "first", port: closedPort(t)}, {name: "second", port: second.port()}},
+		upstreams: []upSpec{{name: "first", port: closedPort(t), quota: 10}, {name: "second", port: second.port(), quota: 10}},
+		state:     filepath.Join(t.TempDir(), "state.json"),
 		metrics:   "127.0.0.1:0",
 		logPath:   logPath,
 	})
@@ -395,6 +510,8 @@ func TestEndToEndFailover(t *testing.T) {
 	assert.EqualValues(t, 1, metric(t, body, `smtp_relay_upstream_deliveries_total{error_class="connect",result="failure",upstream="first"}`))
 	assert.EqualValues(t, 1, metric(t, body, `smtp_relay_upstream_deliveries_total{error_class="none",result="success",upstream="second"}`))
 	assert.EqualValues(t, 1, metric(t, body, `smtp_relay_messages_received_total{reason="",result="delivered"}`))
+	assert.EqualValues(t, 0, metric(t, body, `smtp_relay_upstream_quota_used{upstream="first"}`))
+	assert.EqualValues(t, 1, metric(t, body, `smtp_relay_upstream_quota_used{upstream="second"}`))
 
 	require.NoError(t, h.stop())
 	lines := logLines(t, logPath)
@@ -534,28 +651,160 @@ func TestStartupFailureReleasesPorts(t *testing.T) {
 	_ = ln.Close()
 }
 
-func TestMetricsPortConflictReleasesSMTP(t *testing.T) {
+func TestMetricsPortBusyNeverBindsSMTP(t *testing.T) {
 	up := startFakeUpstream(t, "", "", "")
 	busy, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	defer busy.Close()
+	smtpAddr := net.JoinHostPort("127.0.0.1", strconv.Itoa(closedPort(t)))
 
 	a, err := New(loadCfg(t, cfgSpec{
 		upstreams: []upSpec{{name: "primary", port: up.port()}},
+		smtpAddr:  smtpAddr,
 		metrics:   busy.Addr().String(),
 	}), "test")
 	require.NoError(t, err)
 
-	require.Error(t, a.Run(context.Background()))
-	require.Eventually(t, func() bool {
-		for _, ad := range a.Addrs() {
-			if c, err := net.DialTimeout("tcp", ad.String(), 200*time.Millisecond); err == nil {
-				_ = c.Close()
-				return false
+	err = a.Run(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "metrics listen")
+	assert.Empty(t, a.Addrs())
+
+	ln, err := net.Listen("tcp", smtpAddr)
+	require.NoError(t, err, "SMTP port must never have been bound")
+	_ = ln.Close()
+}
+
+func TestCloseReleasesUnstartedApp(t *testing.T) {
+	up := startFakeUpstream(t, "", "", "")
+	logPath := filepath.Join(t.TempDir(), "logs", "relay.log")
+	a, err := New(loadCfg(t, cfgSpec{
+		upstreams: []upSpec{{name: "primary", port: up.port(), quota: 5}},
+		state:     filepath.Join(t.TempDir(), "state.json"),
+		logPath:   logPath,
+	}), "test")
+	require.NoError(t, err)
+
+	require.NoError(t, a.Close())
+	require.NoError(t, a.Close(), "Close must be idempotent")
+	assert.Error(t, a.Run(context.Background()), "a closed App must not run")
+}
+
+func TestCloseAfterRunIsNoop(t *testing.T) {
+	up := startFakeUpstream(t, "", "", "")
+	h := start(t, cfgSpec{upstreams: []upSpec{{name: "primary", port: up.port()}}})
+	require.NoError(t, h.stop())
+	assert.NoError(t, h.app.Close())
+}
+
+func TestUpstreamTLS(t *testing.T) {
+	const pw = "tls-s3cret-pw"
+	t.Setenv("RELAY_TEST_UP_PASS", pw)
+
+	tests := []struct {
+		name     string
+		mode     string
+		implicit bool
+	}{
+		{"starttls", "starttls", false},
+		{"implicit tls", "tls", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ca := newTestCA(t, "good-ca")
+			up := startFakeUpstreamTLS(t, "relayuser", pw, "", ca.serverTLS(t), tt.implicit)
+			logPath := filepath.Join(t.TempDir(), "logs", "relay.log")
+			h := start(t, cfgSpec{
+				upstreams: []upSpec{{name: "secure", port: up.port(), user: "relayuser", pass: "${RELAY_TEST_UP_PASS}", tls: tt.mode, ca: ca.writePEM(t)}},
+				metrics:   "127.0.0.1:0",
+				logPath:   logPath,
+			})
+
+			require.NoError(t, h.send("alerts@example.com", []string{"ops@example.com"}, testMail))
+
+			got := up.received()
+			require.Len(t, got, 1)
+			assert.Equal(t, "alerts@example.com", got[0].from)
+			assert.Equal(t, []string{"ops@example.com"}, got[0].to)
+			assert.Equal(t, testMail, got[0].data)
+			up.mu.Lock()
+			assert.Equal(t, []bool{true}, up.authTLS, "AUTH must happen on an encrypted connection")
+			assert.Equal(t, !tt.implicit, up.sawStart)
+			up.mu.Unlock()
+
+			assert.NotContains(t, h.scrape(), pw)
+			require.NoError(t, h.stop())
+			raw, err := os.ReadFile(logPath)
+			require.NoError(t, err)
+			assert.NotContains(t, string(raw), pw)
+			summaries := filterLog(logLines(t, logPath), "mail")
+			require.Len(t, summaries, 1)
+			assert.Equal(t, "delivered", summaries[0]["status"])
+			assert.Equal(t, "secure", summaries[0]["upstream"])
+		})
+	}
+}
+
+func TestUpstreamTLSFailures(t *testing.T) {
+	tests := []struct {
+		name      string
+		mode      string
+		fakeTLS   bool // fake serves TLS (STARTTLS offer)
+		wrongCA   bool
+		wantClass string
+	}{
+		{"starttls not offered", "starttls", false, false, "tls"},
+		{"untrusted certificate", "starttls", true, true, "tls"},
+		{"untrusted certificate implicit", "tls", true, true, "tls"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			const pw = "neg-s3cret-pw"
+			good, other := newTestCA(t, "good-ca"), newTestCA(t, "other-ca")
+			var cfg *tls.Config
+			if tt.fakeTLS {
+				cfg = good.serverTLS(t)
 			}
-		}
-		return true
-	}, 3*time.Second, 10*time.Millisecond)
+			up := startFakeUpstreamTLS(t, "relayuser", pw, "", cfg, tt.mode == "tls")
+			trusted := good
+			if tt.wrongCA {
+				trusted = other
+			}
+			logPath := filepath.Join(t.TempDir(), "logs", "relay.log")
+			h := start(t, cfgSpec{
+				upstreams: []upSpec{{name: "secure", port: up.port(), user: "relayuser", pass: pw, tls: tt.mode, ca: trusted.writePEM(t)}},
+				metrics:   "127.0.0.1:0",
+				logPath:   logPath,
+			})
+
+			err := h.send("alerts@example.com", []string{"ops@example.com"}, testMail)
+			var te *textproto.Error
+			require.ErrorAs(t, err, &te)
+			assert.Equal(t, 421, te.Code)
+
+			up.mu.Lock()
+			assert.Empty(t, up.authTLS, "AUTH must never reach the upstream")
+			assert.False(t, up.sawMail, "MAIL must never reach the upstream")
+			up.mu.Unlock()
+			assert.Empty(t, up.received())
+
+			body := h.scrape()
+			assert.EqualValues(t, 1, metric(t, body, `smtp_relay_upstream_deliveries_total{error_class="`+tt.wantClass+`",result="failure",upstream="secure"}`))
+			assert.NotContains(t, body, pw)
+
+			require.NoError(t, h.stop())
+			lines := logLines(t, logPath)
+			failed := filterLog(lines, "upstream failed")
+			require.Len(t, failed, 1)
+			assert.Equal(t, tt.wantClass, failed[0]["error_class"])
+			summaries := filterLog(lines, "mail")
+			require.Len(t, summaries, 1)
+			assert.Equal(t, "failed", summaries[0]["status"])
+			raw, err := os.ReadFile(logPath)
+			require.NoError(t, err)
+			assert.NotContains(t, string(raw), pw)
+		})
+	}
 }
 
 func TestSenderDenied(t *testing.T) {
@@ -603,7 +852,10 @@ func TestOpenRelayWarningLogged(t *testing.T) {
 func TestShutdownFinishesInFlightMail(t *testing.T) {
 	up := startFakeUpstream(t, "", "", "")
 	up.inData, up.release = make(chan struct{}), make(chan struct{})
-	h := start(t, cfgSpec{upstreams: []upSpec{{name: "primary", port: up.port()}}})
+	h := start(t, cfgSpec{upstreams: []upSpec{{name: "primary", port: up.port()}}, metrics: "127.0.0.1:0"})
+	readyz := "http://" + h.app.MetricsAddr().String() + "/readyz"
+	code, _ := httpStatus(t, readyz)
+	require.Equal(t, http.StatusOK, code)
 
 	sendErr := make(chan error, 1)
 	go func() {
@@ -623,6 +875,8 @@ func TestShutdownFinishesInFlightMail(t *testing.T) {
 		t.Fatal("Run returned while a mail was still in flight")
 	case <-time.After(200 * time.Millisecond):
 	}
+	code, _ = httpStatus(t, readyz)
+	assert.Equal(t, http.StatusServiceUnavailable, code, "not ready once shutdown has started")
 	close(up.release)
 
 	require.NoError(t, <-sendErr)

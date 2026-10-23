@@ -53,7 +53,8 @@ type App struct {
 }
 
 // New builds every component without binding any port. On error everything
-// already created is released.
+// already created is released. An App that is built but never passed to Run
+// must be released with Close.
 func New(cfg *config.Config, version string) (*App, error) {
 	a := &App{cfg: cfg}
 	if err := a.build(version); err != nil {
@@ -163,34 +164,58 @@ func (a *App) MetricsAddr() net.Addr {
 }
 
 // Run starts every component and blocks until ctx is cancelled, then shuts
-// down in order. It returns nil on a clean shutdown. An App can run only once.
+// down in order. It returns nil on a clean shutdown. If in-flight mails do not
+// finish within server.timeouts.shutdown they are cut off and Run returns an
+// error, so the process exits with code 1. An App can run only once.
+//
+// The metrics server is bound before the SMTP listeners (spec 6.6), so a busy
+// metrics port aborts startup before any mail can be accepted. /readyz stays
+// 503 until the SMTP listeners are bound.
 func (a *App) Run(ctx context.Context) error {
 	if !a.started.CompareAndSwap(false, true) {
 		return errors.New("app: already run")
 	}
 
+	metricsStarted := false
+	if a.metSrv != nil {
+		if err := a.metSrv.Start(); err != nil {
+			_ = a.stop(false, false)
+			return err
+		}
+		metricsStarted = true
+	}
+	a.startQuota()
+
 	if err := a.srv.Start(); err != nil {
-		a.stop(false, false)
+		_ = a.stop(false, metricsStarted)
 		return err
 	}
 	a.mu.Lock()
 	a.addrs = a.srv.Addrs()
 	a.mu.Unlock()
 
-	a.startQuota()
-
 	a.ready.Store(true)
-	if a.metSrv != nil {
-		if err := a.metSrv.Start(); err != nil {
-			_ = a.stop(true, false)
-			return err
-		}
-	}
 	a.log.Info().Msg("started")
 
 	<-ctx.Done()
 	a.log.Info().Msg("shutting down")
-	return a.stop(true, a.metSrv != nil)
+	return a.stop(true, metricsStarted)
+}
+
+// Close releases an App that was built but never run. It is a no-op once Run
+// has been called (Run releases everything itself) and can be called twice.
+func (a *App) Close() error {
+	if !a.started.CompareAndSwap(false, true) {
+		return nil
+	}
+	var errs []error
+	if a.quota != nil {
+		errs = append(errs, a.quota.Close())
+	}
+	if a.logger != nil {
+		errs = append(errs, a.logger.Close())
+	}
+	return errors.Join(errs...)
 }
 
 func (a *App) startQuota() {
