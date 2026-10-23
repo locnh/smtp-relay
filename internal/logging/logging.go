@@ -14,6 +14,25 @@ import (
 	"github.com/rs/zerolog"
 )
 
+// logFileMode keeps log files readable by the owner and group only, because
+// they can contain mail Subjects.
+const logFileMode os.FileMode = 0o640
+
+// textFieldsOrder lists the per-mail summary fields (spec 7.2) in the order
+// they should appear in text output.
+var textFieldsOrder = []string{
+	"from", "to", "rcpt_count", "subj", "status", "upstream",
+	"attempts", "size", "duration_ms", "peer", "uuid", "error",
+}
+
+var levels = map[string]zerolog.Level{
+	"trace": zerolog.TraceLevel,
+	"debug": zerolog.DebugLevel,
+	"info":  zerolog.InfoLevel,
+	"warn":  zerolog.WarnLevel,
+	"error": zerolog.ErrorLevel,
+}
+
 // Logger wraps a zerolog.Logger and, for file output, the rotating file it writes to.
 type Logger struct {
 	logger zerolog.Logger
@@ -30,6 +49,10 @@ func New(cfg config.LoggingConfig) (*Logger, error) {
 }
 
 func newWithWriters(cfg config.LoggingConfig, stdout, stderr io.Writer) (*Logger, error) {
+	if cfg.Format != "json" && cfg.Format != "text" {
+		return nil, fmt.Errorf("logging: unknown format %q (want text or json)", cfg.Format)
+	}
+
 	var (
 		out    io.Writer
 		closer io.Closer
@@ -50,15 +73,13 @@ func newWithWriters(cfg config.LoggingConfig, stdout, stderr io.Writer) (*Logger
 		return nil, fmt.Errorf("logging: unknown output %q (want stdout, stderr or file)", cfg.Output)
 	}
 
-	switch cfg.Format {
-	case "json":
-	case "text":
-		out = zerolog.ConsoleWriter{Out: out, NoColor: true, TimeFormat: time.RFC3339}
-	default:
-		if closer != nil {
-			_ = closer.Close()
+	if cfg.Format == "text" {
+		out = zerolog.ConsoleWriter{
+			Out:         out,
+			NoColor:     true,
+			TimeFormat:  time.RFC3339,
+			FieldsOrder: textFieldsOrder,
 		}
-		return nil, fmt.Errorf("logging: unknown format %q (want text or json)", cfg.Format)
 	}
 
 	base := zerolog.New(out).With().Timestamp().Logger()
@@ -68,19 +89,11 @@ func newWithWriters(cfg config.LoggingConfig, stdout, stderr io.Writer) (*Logger
 		lvl = zerolog.InfoLevel
 	}
 	base = base.Level(lvl)
-	if !ok {
+	if !ok && cfg.Level != "" {
 		base.Warn().Str("configured_level", cfg.Level).Msg("unknown log level, using info")
 	}
 
 	return &Logger{logger: base, closer: closer}, nil
-}
-
-var levels = map[string]zerolog.Level{
-	"trace": zerolog.TraceLevel,
-	"debug": zerolog.DebugLevel,
-	"info":  zerolog.InfoLevel,
-	"warn":  zerolog.WarnLevel,
-	"error": zerolog.ErrorLevel,
 }
 
 // Zerolog returns a value copy of the underlying logger.
@@ -89,7 +102,8 @@ func (l *Logger) Zerolog() zerolog.Logger {
 }
 
 // Close flushes and closes the file rotator. It is a no-op for stdout and
-// stderr and safe to call more than once.
+// stderr and safe to call more than once. Writing after Close is not
+// supported: the rotator would reopen the file.
 func (l *Logger) Close() error {
 	l.closeOnce.Do(func() {
 		if l.closer != nil {
@@ -104,9 +118,14 @@ func openRotator(f config.LoggingFileConfig) (*timberjack.Logger, error) {
 		return nil, errors.New("logging: file output requires logging.file.path")
 	}
 	// timberjack opens lazily on first write; probe now so bad paths fail at startup.
-	probe, err := os.OpenFile(f.Path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	// Chmod makes the mode exact regardless of the process umask.
+	probe, err := os.OpenFile(f.Path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, logFileMode)
 	if err != nil {
 		return nil, fmt.Errorf("logging: open log file: %w", err)
+	}
+	if err := probe.Chmod(logFileMode); err != nil {
+		_ = probe.Close()
+		return nil, fmt.Errorf("logging: chmod log file: %w", err)
 	}
 	if err := probe.Close(); err != nil {
 		return nil, fmt.Errorf("logging: close log file probe: %w", err)
@@ -122,5 +141,6 @@ func openRotator(f config.LoggingFileConfig) (*timberjack.Logger, error) {
 		MaxBackups: f.MaxBackups,
 		MaxAge:     f.MaxAgeDays,
 		Compress:   compress,
+		FileMode:   logFileMode,
 	}, nil
 }

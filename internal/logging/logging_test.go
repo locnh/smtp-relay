@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -237,4 +238,95 @@ func TestNewFileCompressDefault(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, rot2.Compress)
 	require.NoError(t, rot2.Close())
+}
+
+func TestNewEmptyLevelIsInfoWithoutWarning(t *testing.T) {
+	t.Parallel()
+
+	var stdout, stderr bytes.Buffer
+	cfg := baseCfg("stdout", "json")
+	cfg.Level = ""
+	l, err := newWithWriters(cfg, &stdout, &stderr)
+	require.NoError(t, err)
+
+	assert.Empty(t, stdout.String(), "empty level must not produce a warning")
+
+	zl := l.Zerolog()
+	zl.Debug().Msg("hidden")
+	zl.Info().Msg("shown")
+	assert.NotContains(t, stdout.String(), "hidden")
+	assert.Contains(t, stdout.String(), "shown")
+}
+
+func TestNewBadFormatLeavesNoFile(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	cfg := config.LoggingConfig{
+		Level: "info", Format: "yaml", Output: "file",
+		File: config.LoggingFileConfig{Path: filepath.Join(dir, "relay.log")},
+	}
+
+	var stdout, stderr bytes.Buffer
+	l, err := newWithWriters(cfg, &stdout, &stderr)
+	assert.Nil(t, l)
+	require.Error(t, err)
+
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	assert.Empty(t, entries)
+}
+
+func TestNewFileMode(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("file modes are not meaningful on windows")
+	}
+
+	path := filepath.Join(t.TempDir(), "relay.log")
+	cfg := baseCfg("file", "json")
+	cfg.File = config.LoggingFileConfig{Path: path}
+
+	var stdout, stderr bytes.Buffer
+	l, err := newWithWriters(cfg, &stdout, &stderr)
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, l.Close()) })
+
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o640), info.Mode().Perm())
+}
+
+func TestNewTextFieldsOrder(t *testing.T) {
+	t.Parallel()
+
+	var stdout, stderr bytes.Buffer
+	l, err := newWithWriters(baseCfg("stdout", "text"), &stdout, &stderr)
+	require.NoError(t, err)
+
+	zl := l.Zerolog()
+	zl.Info().
+		Str("uuid", "u-1").
+		Str("error", "boom").
+		Int("duration_ms", 5).
+		Str("status", "delivered").
+		Str("subj", "hi").
+		Str("from", "a@example.com").
+		Str("to", "b@example.com").
+		Int("rcpt_count", 1).
+		Str("peer", "10.0.0.1").
+		Int("attempts", 1).
+		Int("size", 42).
+		Str("upstream", "ses").
+		Msg("mail")
+
+	line := stdout.String()
+	keys := []string{"from=", "to=", "rcpt_count=", "subj=", "status=", "upstream=", "attempts=", "size=", "duration_ms=", "peer=", "uuid=", "error="}
+	last := -1
+	for _, k := range keys {
+		idx := strings.Index(line, k)
+		require.NotEqual(t, -1, idx, "missing %s in %q", k, line)
+		assert.Greater(t, idx, last, "%s out of order in %q", k, line)
+		last = idx
+	}
 }
