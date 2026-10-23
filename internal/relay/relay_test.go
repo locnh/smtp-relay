@@ -210,7 +210,7 @@ func TestDeliverContextCancelled(t *testing.T) {
 	assert.Empty(t, obs.events)
 }
 
-func TestDeliverDoesNotCopyCallerSliceOrder(t *testing.T) {
+func TestNewCopiesCallerSlice(t *testing.T) {
 	a := &fakeSender{name: "A"}
 	b := &fakeSender{name: "B"}
 	list := []Sender{a, b}
@@ -242,6 +242,47 @@ func TestDeliverConcurrent(t *testing.T) {
 	assert.Equal(t, 50, b.Calls())
 }
 
+func TestDeliverEventInterleaving(t *testing.T) {
+	a := &fakeSender{name: "A", err: errors.New("down")}
+	b := &fakeSender{name: "B"}
+	obs := &recordObserver{}
+
+	New([]Sender{a, b}, obs).Deliver(context.Background(), newMsg())
+
+	assert.Equal(t, []event{
+		{kind: "attempt", upstream: "A", class: upstream.ClassOther},
+		{kind: "failover", upstream: "A", to: "B"},
+		{kind: "attempt", upstream: "B", class: upstream.ClassNone},
+	}, obs.events)
+}
+
+// cancelSender cancels the context from inside Send, simulating a client that
+// disconnects mid-attempt.
+type cancelSender struct {
+	fakeSender
+	cancel context.CancelFunc
+}
+
+func (c *cancelSender) Send(ctx context.Context, from string, to []string, data []byte) error {
+	c.cancel()
+	return c.fakeSender.Send(ctx, from, to, data)
+}
+
+func TestDeliverCancelledDuringAttemptStopsFailover(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	a := &cancelSender{fakeSender: fakeSender{name: "A", err: errors.New("down")}, cancel: cancel}
+	b := &fakeSender{name: "B"}
+	obs := &recordObserver{}
+
+	res := New([]Sender{a, b}, obs).Deliver(ctx, newMsg())
+
+	assert.ErrorIs(t, res.Err, context.Canceled)
+	assert.Equal(t, "", res.Upstream)
+	assert.Equal(t, 0, b.Calls())
+	assert.Empty(t, obs.Failovers())
+	assert.Len(t, res.Attempts, 1)
+}
+
 func TestReply(t *testing.T) {
 	long := strings.Repeat("x", 300)
 	cases := []struct {
@@ -266,11 +307,18 @@ func TestReply(t *testing.T) {
 			wantText:     "no such user",
 		},
 		{
-			name:         "wrapped smtp error",
-			err:          fmt.Errorf("attempt: %w", &upstream.Error{Class: upstream.ClassSMTP5xx, Code: 554, Message: "rejected"}),
-			wantCode:     554,
-			wantEnhanced: [3]int{5, 0, 0},
-			wantText:     "rejected",
+			name:         "auth error with smtp code is hidden",
+			err:          &upstream.Error{Class: upstream.ClassAuth, Code: 535, Message: "5.7.8 bad credentials for user alice@corp.test", Err: errors.New("auth")},
+			wantCode:     421,
+			wantEnhanced: [3]int{4, 4, 0},
+			wantText:     "Forwarding failed",
+		},
+		{
+			name:         "tls error with smtp code is hidden",
+			err:          &upstream.Error{Class: upstream.ClassTLS, Code: 454, Message: "TLS not available", Err: errors.New("tls")},
+			wantCode:     421,
+			wantEnhanced: [3]int{4, 4, 0},
+			wantText:     "Forwarding failed",
 		},
 		{
 			name:         "connect error without code",
@@ -287,11 +335,25 @@ func TestReply(t *testing.T) {
 			wantText:     "Forwarding failed",
 		},
 		{
+			name:         "wrapped smtp error",
+			err:          fmt.Errorf("attempt: %w", &upstream.Error{Class: upstream.ClassSMTP5xx, Code: 554, Message: "rejected"}),
+			wantCode:     554,
+			wantEnhanced: [3]int{5, 0, 0},
+			wantText:     "rejected",
+		},
+		{
 			name:         "multiline message is flattened",
 			err:          &upstream.Error{Class: upstream.ClassSMTP5xx, Code: 550, Message: "line one\r\nline two\nline three"},
 			wantCode:     550,
 			wantEnhanced: [3]int{5, 0, 0},
 			wantText:     "line one  line two line three",
+		},
+		{
+			name:         "whitespace around message is trimmed",
+			err:          &upstream.Error{Class: upstream.ClassSMTP5xx, Code: 550, Message: "\n  rejected \r\n"},
+			wantCode:     550,
+			wantEnhanced: [3]int{5, 0, 0},
+			wantText:     "rejected",
 		},
 		{
 			name:         "long message is trimmed to 200 chars",

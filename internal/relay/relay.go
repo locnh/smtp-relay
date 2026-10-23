@@ -40,6 +40,7 @@ func (r *Relay) Deliver(ctx context.Context, msg *Message) Result {
 
 	var res Result
 	for i, s := range r.senders {
+		// On cancellation Err becomes ctx.Err(); errors from earlier attempts stay in Attempts.
 		if err := ctx.Err(); err != nil {
 			res.Err = err
 			return res
@@ -70,13 +71,17 @@ func (r *Relay) Deliver(ctx context.Context, msg *Message) Result {
 }
 
 // Reply maps a failed Result to the SMTP reply the client should receive.
+// Only genuine upstream 4xx/5xx replies keep their code and message. Every
+// other failure (connect, TLS, auth, timeout, Err == nil) becomes
+// 421 4.4.0 Forwarding failed, so callers must only call Reply on failed results.
 // Hostnames and usernames never appear in the text.
 func (r Result) Reply() (code int, enhanced [3]int, text string) {
 	if errors.Is(r.Err, ErrNoSenders) {
 		return 554, [3]int{5, 3, 0}, "No upstream configured"
 	}
 	var ue *upstream.Error
-	if errors.As(r.Err, &ue) && ue.Code != 0 {
+	if errors.As(r.Err, &ue) && ue.Code != 0 &&
+		(ue.Class == upstream.ClassSMTP4xx || ue.Class == upstream.ClassSMTP5xx) {
 		return ue.Code, [3]int{ue.Code / 100, 0, 0}, replyText(ue.Message)
 	}
 	return 421, [3]int{4, 4, 0}, "Forwarding failed"
@@ -84,9 +89,9 @@ func (r Result) Reply() (code int, enhanced [3]int, text string) {
 
 // replyText makes an upstream message safe to put on a single SMTP reply line.
 func replyText(s string) string {
-	s = strings.NewReplacer("\r", " ", "\n", " ").Replace(s)
+	s = strings.TrimSpace(strings.NewReplacer("\r", " ", "\n", " ").Replace(s))
 	if utf8.RuneCountInString(s) > maxReplyText {
-		s = string([]rune(s)[:maxReplyText])
+		s = strings.TrimSpace(string([]rune(s)[:maxReplyText]))
 	}
 	return s
 }
