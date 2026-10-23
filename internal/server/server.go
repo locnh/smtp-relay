@@ -118,6 +118,9 @@ func New(c Config) (*Server, error) {
 	if sc.Limits.MaxConnections == 0 || sc.Limits.MaxConnections < -1 {
 		return nil, errors.New("server: max_connections must be -1 or >= 1")
 	}
+	if sc.Limits.MaxLineLength < 1000 {
+		return nil, errors.New("server: max_line_length must be >= 1000")
+	}
 
 	s := &Server{
 		policy:      c.Policy,
@@ -175,6 +178,9 @@ func New(c Config) (*Server, error) {
 		srv.WriteTimeout = sc.Timeouts.Write
 		srv.MaxMessageBytes = sc.Limits.MaxMessageSize
 		srv.MaxRecipients = sc.Limits.MaxRecipients
+		// go-smtp's default (2000) would also reject long DATA lines, which a
+		// transparent relay must forward. Config validation guarantees >= 1000.
+		srv.MaxLineLength = sc.Limits.MaxLineLength
 		srv.EnableSMTPUTF8 = true
 		srv.ErrorLog = zlogger{c.Log}
 		if l.TLS == "starttls" {

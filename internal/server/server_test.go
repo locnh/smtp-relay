@@ -165,7 +165,7 @@ func baseConfig(listen ...config.ListenConfig) Config {
 		Server: config.ServerConfig{
 			Listen:   listen,
 			Timeouts: config.ServerTimeouts{Read: 5 * time.Second, Write: 5 * time.Second, Data: 5 * time.Second, Shutdown: 5 * time.Second},
-			Limits:   config.ServerLimits{MaxConnections: 100, MaxMessageSize: 1 << 20, MaxRecipients: 100},
+			Limits:   config.ServerLimits{MaxConnections: 100, MaxMessageSize: 1 << 20, MaxRecipients: 100, MaxLineLength: 1 << 20},
 		},
 		Policy:   NewPolicy(config.AccessConfig{}),
 		Log:      zerolog.Nop(),
@@ -755,6 +755,8 @@ func TestNewErrors(t *testing.T) {
 		{"unknown listener mode", func(c *Config) {
 			c.Server.Listen = []config.ListenConfig{{Address: "127.0.0.1:0", TLS: "bogus"}}
 		}},
+		{"max_line_length zero", func(c *Config) { c.Server.Limits.MaxLineLength = 0 }},
+		{"max_line_length below minimum", func(c *Config) { c.Server.Limits.MaxLineLength = 999 }},
 		{"max_connections zero", func(c *Config) { c.Server.Limits.MaxConnections = 0 }},
 		{"max_connections below -1", func(c *Config) { c.Server.Limits.MaxConnections = -2 }},
 		{"nil deliverer", func(c *Config) { c.Deliverer = nil }},
@@ -1156,4 +1158,89 @@ func TestBDATResetAndDisconnectMidTransfer(t *testing.T) {
 	_, done, _ := h.ev.snapshot()
 	assert.Len(t, done, 20, "only the completed mails are delivered")
 	require.Eventually(t, func() bool { live, _ := h.ev.liveCount(); return live == 0 }, 3*time.Second, 10*time.Millisecond)
+}
+
+func TestLongDataLines(t *testing.T) {
+	c0 := baseConfig()
+	c0.Server.Limits.MaxMessageSize = 4 << 20
+	h := start(t, c0)
+
+	for _, n := range []int{900, 3000, 100000, 1000000} {
+		t.Run(fmt.Sprintf("%d bytes", n), func(t *testing.T) {
+			c := dialRaw(t, h.addr(0))
+			c.greet()
+			body := "Subject: long\r\n\r\n" + strings.Repeat("a", n)
+			l := c.sendMail("a@example.com", []string{"b@x.test"}, body)
+			assert.Equal(t, "250 2.0.0 OK: queued", l)
+			msgs := h.del.messages()
+			assert.Equal(t, body+"\r\n", string(msgs[len(msgs)-1].Data))
+		})
+	}
+}
+
+func TestLongDataLineAboveMaxLineLength(t *testing.T) {
+	c0 := baseConfig()
+	c0.Server.Limits.MaxLineLength = 1000
+	h := start(t, c0)
+	c := dialRaw(t, h.addr(0))
+	c.greet()
+	l := c.sendMail("a@example.com", []string{"b@x.test"}, "Subject: s\r\n\r\n"+strings.Repeat("a", 3000))
+	assert.Equal(t, "451 4.3.0 Error reading message", l)
+	c.expectEOF()
+	_, done, _ := h.ev.snapshot()
+	assert.Empty(t, done)
+	assert.Empty(t, h.del.messages())
+	require.Eventually(t, func() bool { live, _ := h.ev.liveCount(); return live == 0 }, 3*time.Second, 10*time.Millisecond)
+
+	// A line within the limit is still fine.
+	c2 := dialRaw(t, h.addr(0))
+	c2.greet()
+	assert.True(t, strings.HasPrefix(c2.sendMail("a@example.com", []string{"b@x.test"}, "Subject: s\r\n\r\n"+strings.Repeat("a", 900)), "250 "))
+}
+
+func TestOversizedCommandLineIsBounded(t *testing.T) {
+	c0 := baseConfig()
+	c0.Server.Limits.MaxLineLength = 2000
+	h := start(t, c0)
+	c := dialRaw(t, h.addr(0))
+	c.greet()
+
+	// 2 MiB with no line break: the server must stop reading near the limit.
+	go func() {
+		_, _ = c.conn.Write([]byte("MAIL FROM:<" + strings.Repeat("a", 2<<20) + ">\r\n"))
+	}()
+	l, _ := c.reply()
+	assert.True(t, strings.HasPrefix(l, "500 5.4.0 Too long line"), l)
+	c.expectEOF()
+	require.Eventually(t, func() bool { live, _ := h.ev.liveCount(); return live == 0 }, 3*time.Second, 10*time.Millisecond)
+	assert.Empty(t, h.del.messages())
+}
+
+func TestBDATLongLine(t *testing.T) {
+	c0 := baseConfig()
+	c0.Server.Limits.MaxMessageSize = 4 << 20
+	h := start(t, c0)
+
+	body := "Subject: bdat\r\n\r\n" + strings.Repeat("a", 100000) + "\r\n"
+	c := dialRaw(t, h.addr(0))
+	c.greet()
+	c.envelope()
+	c.bdat(len(body), true, body)
+	l, _ := c.reply()
+	assert.Equal(t, "250 2.0.0 OK: queued", l)
+	assert.Equal(t, body, string(h.del.messages()[0].Data))
+
+	// go-smtp only lifts the line limit once it has parsed the BDAT command, but a client
+	// sends the chunk right behind the command, so bytes already buffered are counted
+	// against max_line_length: in practice the limit applies to BDAT as well.
+	small := baseConfig()
+	small.Server.Limits.MaxLineLength = 1000
+	hs := start(t, small)
+	c2 := dialRaw(t, hs.addr(0))
+	c2.greet()
+	c2.envelope()
+	c2.bdat(len(body), true, body)
+	l, _ = c2.reply()
+	assert.True(t, strings.HasPrefix(l, "500 5.4.0 Too long line"), l)
+	assert.Empty(t, hs.del.messages())
 }

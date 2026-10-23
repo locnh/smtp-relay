@@ -230,6 +230,10 @@ func (s *Session) dataReadError(err error, from string) error {
 		s.log.Warn().Str("peer", s.peer).Str("sender_address", maillog.Sanitize(from)).
 			Msg("message too large")
 		return smtp.ErrDataTooLarge
+	case errors.Is(err, smtp.ErrTooLongLine):
+		s.drop.Store(true)
+		s.log.Warn().Str("peer", s.peer).Msg("line exceeds max_line_length")
+		return errReadFailed
 	case errors.Is(err, smtp.ErrDataReset):
 		// RSET or disconnect during BDAT: the transaction was abandoned.
 		return err
