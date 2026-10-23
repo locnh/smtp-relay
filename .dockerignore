@@ -2,6 +2,8 @@
 .github
 .gitignore
 .dockerignore
+.superpowers
+.DS_Store
 tasks
 spec.md
 README.md
@@ -13,7 +15,8 @@ config.yaml
 config.example.yaml
 config.docker.example.yaml
 .env
+.env.*
 *.test
 *.out
+coverage.*
 /smtp-relay
-.env.*

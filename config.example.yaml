@@ -12,6 +12,7 @@ server:
   # Name used in the SMTP banner and in EHLO towards upstreams.
   # Use a real FQDN. Default: the system hostname.
   hostname: relay.home.lan
+  # Optional text appended to the hostname in the 220 greeting ("220 relay.home.lan <text> ESMTP ...").
   welcome_message: ""
 
   # Default: [{address: "127.0.0.1:25", tls: none}]
@@ -36,8 +37,10 @@ server:
     data: 5m
     shutdown: 30s          # max wait for in-flight mails on SIGTERM
 
+  # Every message is held in memory until it is delivered, so the worst case is about
+  # max_message_size x max_connections (~1 GB at these defaults). Lower one of them on small hosts.
   limits:
-    max_connections: 100   # -1 = unlimited
+    max_connections: 100   # -1 = unlimited; shared by all listeners
     max_message_size: 10240000   # bytes
     max_recipients: 100
 
@@ -94,7 +97,7 @@ upstreams:
       window: 24h
 
 # Required when any upstream has a quota. Holds the quota counters so they
-# survive restarts. One instance per file.
+# survive restarts (saved at most every 10 s and on shutdown). One instance per file.
 state:
   file: /var/lib/smtp-relay/state.json
 
@@ -109,6 +112,7 @@ logging:
   #   max_age_days: 30
   #   compress: true
 
+# Also serves /healthz and /readyz on the same address. No authentication.
 metrics:
   enabled: false
   listen: "127.0.0.1:9090"       # keep on loopback unless you firewall it

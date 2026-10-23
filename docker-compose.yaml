@@ -13,14 +13,18 @@ services:
 
     ports:
       # SMTP. The container listens on 2525 (non-root), the host exposes 25.
-      # To expose only on one LAN interface, use e.g. "192.168.1.10:25:2525".
+      # "25:2525" binds ALL host interfaces. To expose only one LAN address, use
+      # e.g. "192.168.1.10:25:2525". See "Docker and NAT" in README.md: the relay
+      # cannot see real client IPs behind Docker Desktop / Colima / userland-proxy.
       - "25:2525"
       # Metrics, loopback only on the host. Remove if you do not scrape them.
       - "127.0.0.1:9090:9090"
 
     volumes:
       - ./config.yaml:/etc/smtp-relay/config.yaml:ro
-      # Quota counters; named volume keeps them across restarts and upgrades.
+      # Quota counters. A named volume keeps them across restarts and upgrades and
+      # inherits the image's ownership of this directory (UID 10001) on first use.
+      # With a bind mount instead, chown the host directory to 10001:10001 yourself.
       - state:/var/lib/smtp-relay
 
     # Secrets referenced as ${NAME} in config.yaml. Put them in a .env file next
@@ -32,7 +36,9 @@ services:
       # UPSTREAM2_PASS: ${UPSTREAM2_PASS:?set UPSTREAM2_PASS in .env}
       TZ: ${TZ:-UTC}
 
-    # Requires metrics.enabled: true in config.yaml (the default in config.docker.example.yaml).
+    # The image has no built-in HEALTHCHECK. This one calls /healthz, which only
+    # exists when metrics.enabled is true (the default in config.docker.example.yaml)
+    # and metrics.listen is 0.0.0.0:9090. Without that the container shows "unhealthy".
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/healthz"]
       interval: 30s
@@ -40,7 +46,7 @@ services:
       start_period: 10s
       retries: 3
 
-    # Hardening
+    # Hardening. The app writes only to the state volume; logs go to stdout.
     read_only: true
     tmpfs:
       - /tmp
@@ -49,7 +55,11 @@ services:
     security_opt:
       - no-new-privileges:true
 
-    stop_grace_period: 40s   # server.timeouts.shutdown (30s) + margin
+    # Worst case for a clean stop = server.timeouts.shutdown (30s) + up to 5s for
+    # cut-off deliveries to unwind + up to 5s for the metrics server. If you raise
+    # server.timeouts.shutdown, keep this at least 20s above it, or Docker sends
+    # SIGKILL before the quota state is flushed.
+    stop_grace_period: 50s
 
     logging:
       driver: json-file

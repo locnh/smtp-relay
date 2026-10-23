@@ -4,7 +4,8 @@
 #
 # Differences from config.example.yaml:
 #   - listens on 2525 (non-root cannot bind 25); compose publishes it as host port 25
-#   - metrics listen on 0.0.0.0 INSIDE the container; compose publishes it on host loopback only
+#   - metrics listen on 0.0.0.0:9090 INSIDE the container; compose publishes it on host loopback only.
+#     Keep metrics.enabled: true and that port: the compose healthcheck calls /healthz there.
 #   - logs go to stdout (use `docker compose logs`)
 #   - secrets come from environment variables set in docker-compose.yaml / .env
 
@@ -13,6 +14,11 @@ server:
   listen:
     - address: "0.0.0.0:2525"
       tls: none
+  # Messages are held in memory: worst case is max_message_size x max_connections
+  # (~1 GB at the defaults of 10240000 bytes x 100). Lower them on small hosts.
+  # limits:
+  #   max_connections: 100
+  #   max_message_size: 10240000
 
 access:
   # IMPORTANT: clients are not authenticated, this list is the only gate.

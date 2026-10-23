@@ -1,8 +1,9 @@
 /smtp-relay
 /config.yaml
 .env
+.env.*
+!.env.example
+.DS_Store
 *.test
 *.out
 coverage.*
-.env.*
-!.env.example
