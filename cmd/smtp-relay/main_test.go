@@ -17,6 +17,9 @@ func TestRealMain(t *testing.T) {
 	require.NoError(t, os.WriteFile(good, []byte("upstreams: [{name: a, host: h}]\n"), 0o600))
 	require.NoError(t, os.WriteFile(bad, []byte("upstreams: [{name: A, host: h}]\n"), 0o600))
 
+	noTLS := filepath.Join(dir, "notls.yaml")
+	require.NoError(t, os.WriteFile(noTLS, []byte("server: {listen: [{address: \"127.0.0.1:0\", tls: starttls}]}\nupstreams: [{name: a, host: h}]\n"), 0o600))
+
 	tests := []struct {
 		name       string
 		args       []string
@@ -31,7 +34,8 @@ func TestRealMain(t *testing.T) {
 		{"check invalid", []string{"-config", bad, "-check-config"}, 1, "", "upstreams[0].name: must match"},
 		{"missing file", []string{"-config", filepath.Join(dir, "none.yaml"), "-check-config"}, 1, "", "smtp-relay: read config"},
 		{"extra positional arg", []string{"-config", good, "extra"}, 2, "", `unexpected argument "extra"`},
-		{"run stub", []string{"-config", good}, 1, "", "server not implemented yet (task 8)"},
+		{"run invalid config", []string{"-config", bad}, 1, "", "invalid configuration"},
+		{"run unreadable tls", []string{"-config", noTLS}, 1, "", "smtp-relay: invalid configuration"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

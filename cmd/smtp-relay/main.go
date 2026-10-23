@@ -1,12 +1,16 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
+	"syscall"
 
+	"github.com/locnh/smtp-relay/internal/app"
 	"github.com/locnh/smtp-relay/internal/config"
 )
 
@@ -73,7 +77,14 @@ func realMain(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-// run is replaced by the real server in task 8.
+// run starts the relay and blocks until SIGINT/SIGTERM. Configuration
+// warnings are logged by the app itself.
 func run(cfg *config.Config) error {
-	return errors.New("server not implemented yet (task 8)")
+	a, err := app.New(cfg, version)
+	if err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return a.Run(ctx)
 }
