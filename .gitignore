@@ -1,0 +1,6 @@
+/smtp-relay
+/config.yaml
+.env
+*.test
+*.out
+coverage.*

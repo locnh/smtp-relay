@@ -1,0 +1,61 @@
+name: smtp-relay
+
+services:
+  smtp-relay:
+    build:
+      context: .
+      args:
+        VERSION: ${VERSION:-dev}
+        BUILD_TIME: ${BUILD_TIME:-unknown}
+    image: smtp-relay:${VERSION:-dev}
+    container_name: smtp-relay
+    restart: unless-stopped
+
+    ports:
+      # SMTP. The container listens on 2525 (non-root), the host exposes 25.
+      # To expose only on one LAN interface, use e.g. "192.168.1.10:25:2525".
+      - "25:2525"
+      # Metrics, loopback only on the host. Remove if you do not scrape them.
+      - "127.0.0.1:9090:9090"
+
+    volumes:
+      - ./config.yaml:/etc/smtp-relay/config.yaml:ro
+      # Quota counters; named volume keeps them across restarts and upgrades.
+      - state:/var/lib/smtp-relay
+
+    # Secrets referenced as ${NAME} in config.yaml. Put them in a .env file next
+    # to this file (never commit it); compose fails fast if one is missing.
+    environment:
+      UPSTREAM1_USER: ${UPSTREAM1_USER:?set UPSTREAM1_USER in .env}
+      UPSTREAM1_PASS: ${UPSTREAM1_PASS:?set UPSTREAM1_PASS in .env}
+      # UPSTREAM2_USER: ${UPSTREAM2_USER:?set UPSTREAM2_USER in .env}
+      # UPSTREAM2_PASS: ${UPSTREAM2_PASS:?set UPSTREAM2_PASS in .env}
+      TZ: ${TZ:-UTC}
+
+    # Requires metrics.enabled: true in config.yaml (the default in config.docker.example.yaml).
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+    # Hardening
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+    stop_grace_period: 40s   # server.timeouts.shutdown (30s) + margin
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  state:

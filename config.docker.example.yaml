@@ -1,0 +1,62 @@
+# Config for running smtp-relay in Docker (see docker-compose.yaml).
+# Copy to config.yaml and edit:   cp config.docker.example.yaml config.yaml
+# Validate:  docker compose run --rm smtp-relay -config /etc/smtp-relay/config.yaml -check-config
+#
+# Differences from config.example.yaml:
+#   - listens on 2525 (non-root cannot bind 25); compose publishes it as host port 25
+#   - metrics listen on 0.0.0.0 INSIDE the container; compose publishes it on host loopback only
+#   - logs go to stdout (use `docker compose logs`)
+#   - secrets come from environment variables set in docker-compose.yaml / .env
+
+server:
+  hostname: relay.home.lan       # set to a real FQDN, used in EHLO towards upstreams
+  listen:
+    - address: "0.0.0.0:2525"
+      tls: none
+
+access:
+  # IMPORTANT: clients are not authenticated, this list is the only gate.
+  # With Docker NAT (Docker Desktop, Colima, userland-proxy) the relay sees the
+  # Docker bridge gateway (172.16.0.0/12) as the source, NOT the real client IP.
+  # So restrict who can reach the published port with your host firewall, or
+  # publish on a specific LAN interface IP in docker-compose.yaml.
+  # On Linux with iptables DNAT the real client IP is preserved.
+  allowed_networks:
+    - 192.168.0.0/16
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+  allowed_senders: []
+  allowed_sender_domains:
+    - example.com
+
+upstreams:
+  - name: primary
+    host: smtp.example.com
+    tls: starttls
+    auth:
+      username: ${UPSTREAM1_USER}
+      password: ${UPSTREAM1_PASS}
+    quota:
+      limit: 1000
+      window: 24h
+
+  # Optional fallback, tried only when the first upstream fails.
+  # - name: secondary
+  #   host: smtp.fallback.example.net
+  #   tls: starttls
+  #   auth:
+  #     username: ${UPSTREAM2_USER}
+  #     password: ${UPSTREAM2_PASS}
+
+state:
+  file: /var/lib/smtp-relay/state.json   # on the named volume, survives restarts
+
+logging:
+  level: info
+  format: text                   # or json
+  output: stdout
+
+metrics:
+  enabled: true
+  listen: "0.0.0.0:9090"
+  path: /metrics
