@@ -16,3 +16,4 @@ config.docker.example.yaml
 *.test
 *.out
 /smtp-relay
+.env.*
