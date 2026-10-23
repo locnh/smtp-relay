@@ -17,6 +17,8 @@ type Config struct {
 	State     StateConfig      `yaml:"state"`
 	Logging   LoggingConfig    `yaml:"logging"`
 	Metrics   MetricsConfig    `yaml:"metrics"`
+
+	warnings []string
 }
 
 // ServerConfig describes the listening side of the relay.
