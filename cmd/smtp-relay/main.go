@@ -78,7 +78,8 @@ func realMain(args []string, stdout, stderr io.Writer) int {
 }
 
 // run starts the relay and blocks until SIGINT/SIGTERM. Configuration
-// warnings are logged by the app itself.
+// warnings are logged by the app itself. A drain that exceeds
+// server.timeouts.shutdown makes Run return an error, hence exit code 1.
 func run(cfg *config.Config) error {
 	a, err := app.New(cfg, version)
 	if err != nil {
@@ -86,5 +87,8 @@ func run(cfg *config.Config) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// Restore the default signal behaviour as soon as the first signal
+	// arrives, so a second SIGINT/SIGTERM during a slow shutdown kills the process.
+	context.AfterFunc(ctx, stop)
 	return a.Run(ctx)
 }
