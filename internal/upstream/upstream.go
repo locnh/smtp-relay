@@ -30,7 +30,7 @@ type Sender struct {
 	cfg      config.UpstreamConfig
 	ehloName string
 	tlsCfg   *tls.Config
-	password string
+	password config.Secret
 	connect  time.Duration
 	command  time.Duration
 	data     time.Duration
@@ -85,14 +85,7 @@ func New(cfg config.UpstreamConfig, ehloName string) (*Sender, error) {
 		default:
 			return nil, fmt.Errorf("upstream %q: unknown auth mechanism %q", cfg.Name, a.Mechanism)
 		}
-		s.password = a.Password.Reveal()
-		if s.password == "" && a.PasswordFile != "" {
-			b, err := os.ReadFile(a.PasswordFile)
-			if err != nil {
-				return nil, fmt.Errorf("upstream %q: read password_file: %w", cfg.Name, err)
-			}
-			s.password = strings.TrimRight(string(b), "\r\n")
-		}
+		s.password = a.Password
 	}
 	return s, nil
 }
@@ -106,6 +99,11 @@ func orDefault(d, def time.Duration) time.Duration {
 
 // Name returns the configured upstream name.
 func (s *Sender) Name() string { return s.cfg.Name }
+
+// String and GoString keep credentials out of logs: fmt cannot call
+// config.Secret.String on unexported fields, so it would print them raw.
+func (s Sender) String() string   { return "upstream.Sender(" + s.cfg.Name + ")" }
+func (s Sender) GoString() string { return s.String() }
 
 type stage int
 
@@ -131,6 +129,8 @@ func (s *Sender) Send(ctx context.Context, from string, to []string, data []byte
 	if err == nil {
 		return nil
 	}
+	// If ctx expires at the very instant an SMTP reply arrives, the reply can
+	// be reclassified as timeout/other here; the window is negligible.
 	if cerr := ctx.Err(); cerr != nil {
 		ue := ctxError(cerr)
 		ue.Err = fmt.Errorf("%w (%v)", cerr, err)
@@ -206,6 +206,8 @@ func (s *Sender) send(ctx context.Context, st *stage, from string, to []string, 
 		_ = c.Close()
 	}()
 
+	// Hello sends EHLO (falling back to HELO) right away, so a failure here is
+	// classified by the greeting stage in every TLS mode, never as TLS/auth.
 	deadline(s.command)
 	if err := c.Hello(s.ehloName); err != nil {
 		return err
@@ -285,13 +287,15 @@ func (s *Sender) authenticator(c *smtp.Client) (smtp.Auth, error) {
 		return nil, &Error{Class: ClassAuth, Err: fmt.Errorf("server does not advertise AUTH %s", strings.ToUpper(mech))}
 	}
 	if mech == "plain" {
-		return &plainAuth{a.Username, s.password, a.AllowInsecureAuth}, nil
+		return &plainAuth{a.Username, s.password.Reveal(), a.AllowInsecureAuth}, nil
 	}
-	return &loginAuth{username: a.Username, password: s.password, allowInsecure: a.AllowInsecureAuth}, nil
+	return &loginAuth{username: a.Username, password: s.password.Reveal(), allowInsecure: a.AllowInsecureAuth}, nil
 }
 
 // isTLSAlert detects an alert sent by the peer; crypto/tls does not export the
-// alert type, only wraps it in a *net.OpError with Op "remote error".
+// alert type, only wraps it in a *net.OpError with Op "remote error". This
+// relies on that stdlib string and is guarded by the mTLS "without client
+// cert" tests.
 func isTLSAlert(err error) bool {
 	var op *net.OpError
 	return errors.As(err, &op) && op.Op == "remote error"
@@ -320,6 +324,8 @@ func classify(st stage, err error) *Error {
 	case isTLSAlert(err) || errors.As(err, &certErr):
 		e.Class = ClassTLS
 	case st == stageDial:
+		// A dial timeout is deliberately ClassTimeout (checked above), not
+		// ClassConnect: an unreachable host that never answers is a timeout.
 		e.Class = ClassConnect
 	case st == stageStartTLS:
 		e.Class = ClassTLS

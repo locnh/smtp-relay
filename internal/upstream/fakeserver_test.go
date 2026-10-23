@@ -112,7 +112,8 @@ type serverOpts struct {
 	User, Pass string      // accepted credentials
 
 	// Fail maps a stage to a complete reply line that replaces the normal one.
-	// Stages: MAIL, RCPT, DATA, AFTERDATA, STARTTLS.
+	// Stages: EHLO (also answers the HELO fallback), MAIL, RCPT, DATA,
+	// AFTERDATA, STARTTLS.
 	Fail map[string]string
 	// Hang makes the server stop answering at a stage: GREETING, EHLO,
 	// STARTTLS, AUTH, MAIL, RCPT, DATA, AFTERDATA.
@@ -271,6 +272,10 @@ func (s *fakeServer) handle(raw net.Conn) {
 			s.mu.Unlock()
 			if stop("EHLO") {
 				return
+			}
+			if f, found := s.opts.Fail["EHLO"]; found {
+				reply(f)
+				continue
 			}
 			reply("250-fake.test")
 			reply("250-8BITMIME")

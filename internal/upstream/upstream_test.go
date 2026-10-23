@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"net"
+	"net/textproto"
 	"strings"
 	"testing"
 	"time"
@@ -335,9 +337,6 @@ func TestNew_Validation(t *testing.T) {
 			c.TLSOptions.ClientKeyFile = "/nonexistent/k.pem"
 		}},
 		{"unknown mechanism", func(c *config.UpstreamConfig) { c.Auth = &config.AuthConfig{Mechanism: "cram-md5"} }},
-		{"missing password file", func(c *config.UpstreamConfig) {
-			c.Auth = &config.AuthConfig{Mechanism: "auto", PasswordFile: "/nonexistent/pw"}
-		}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -347,16 +346,6 @@ func TestNew_Validation(t *testing.T) {
 			assert.Error(t, err)
 		})
 	}
-}
-
-func TestSend_PasswordFile(t *testing.T) {
-	srv := startServer(t, serverOpts{AuthMechs: "PLAIN", User: user, Pass: pass})
-	cfg := baseCfg(srv.port(), "none")
-	cfg.Auth = &config.AuthConfig{
-		Mechanism: "auto", Username: user, AllowInsecureAuth: true,
-		PasswordFile: writeFile(t, "pw", []byte(pass+"\n")),
-	}
-	require.NoError(t, send(t, cfg))
 }
 
 func TestSend_ConnectionRefused(t *testing.T) {
@@ -453,7 +442,7 @@ func TestSend_SMTPErrorClassification(t *testing.T) {
 			ue := requireClass(t, err, tc.class)
 			assert.Equal(t, tc.code, ue.Code)
 			assert.Equal(t, tc.msg, ue.Message)
-			var te interface{ Error() string }
+			var te *textproto.Error
 			assert.ErrorAs(t, err, &te)
 			assert.False(t, srv.received().Delivered)
 		})
@@ -468,7 +457,7 @@ func TestSend_AbruptClose(t *testing.T) {
 			require.Error(t, err)
 			var ue *upstream.Error
 			require.ErrorAs(t, err, &ue)
-			assert.Contains(t, []upstream.Class{upstream.ClassOther, upstream.ClassConnect}, ue.Class)
+			assert.Equal(t, upstream.ClassOther, ue.Class)
 			assert.Zero(t, ue.Code)
 		})
 	}
@@ -609,5 +598,80 @@ func TestSend_ErrorsNeverContainSecrets(t *testing.T) {
 		if errors.As(err, &ue) {
 			assert.NotContains(t, ue.Message, pass)
 		}
+	}
+}
+
+func TestSend_EHLOFailureClassifiedLikeEveryMode(t *testing.T) {
+	p := newPKI(t)
+	modes := []struct {
+		name string
+		mode string
+		auth bool
+	}{
+		{"none", "none", false},
+		{"none with auth", "none", true},
+		{"starttls with auth", "starttls", true},
+		{"tls with auth", "tls", true},
+	}
+	scripts := []struct {
+		name  string
+		opts  serverOpts
+		class upstream.Class
+		code  int
+		msg   string
+	}{
+		{"4xx", serverOpts{Fail: map[string]string{"EHLO": "421 4.3.2 service shutting down"}}, upstream.ClassSMTP4xx, 421, "4.3.2 service shutting down"},
+		{"5xx", serverOpts{Fail: map[string]string{"EHLO": "554 5.5.1 no service for you"}}, upstream.ClassSMTP5xx, 554, "5.5.1 no service for you"},
+		{"abrupt close", serverOpts{CloseAt: "EHLO"}, upstream.ClassOther, 0, ""},
+	}
+	for _, m := range modes {
+		for _, sc := range scripts {
+			t.Run(m.name+"/"+sc.name, func(t *testing.T) {
+				o := sc.opts
+				o.TLSConfig = p.serverTLS
+				o.StartTLS = true
+				o.Implicit = m.mode == "tls"
+				o.AuthMechs = "PLAIN"
+				o.User, o.Pass = user, pass
+				srv := startServer(t, o)
+				cfg := baseCfg(srv.port(), m.mode)
+				cfg.TLSOptions.CAFile = p.caFile
+				if m.auth {
+					cfg = withAuth(cfg, "auto", false)
+				}
+
+				ue := requireClass(t, send(t, cfg), sc.class)
+				assert.Equal(t, sc.code, ue.Code)
+				assert.Equal(t, sc.msg, ue.Message)
+				assert.False(t, srv.leaked(user, pass))
+				assert.False(t, srv.sawAny("MAIL", "STARTTLS"))
+			})
+		}
+	}
+}
+
+func TestSend_DialTimeoutIsTimeoutClass(t *testing.T) {
+	// 192.0.2.0/24 (TEST-NET-1) is unroutable: the SYN goes unanswered. Some
+	// sandboxes reject it immediately instead, which is a connect error.
+	cfg := baseCfg(25, "none")
+	cfg.Host = "192.0.2.1"
+	cfg.Timeouts.Connect = 200 * time.Millisecond
+	start := time.Now()
+	err := send(t, cfg)
+	require.Error(t, err)
+	if upstream.ClassOf(err) == upstream.ClassConnect {
+		t.Skipf("network rejects TEST-NET-1 immediately: %v", err)
+	}
+	requireClass(t, err, upstream.ClassTimeout)
+	assert.Less(t, time.Since(start), 2*time.Second)
+}
+
+func TestSender_FormattingDoesNotLeakPassword(t *testing.T) {
+	s, err := upstream.New(withAuth(baseCfg(25, "none"), "auto", false), ehlo)
+	require.NoError(t, err)
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s"} {
+		assert.NotContains(t, fmt.Sprintf(verb, s), pass, verb)
+		assert.NotContains(t, fmt.Sprintf(verb, *s), pass, verb)
+		assert.NotContains(t, fmt.Sprintf(verb, []*upstream.Sender{s}), pass, verb)
 	}
 }
