@@ -39,7 +39,7 @@ type upstreamCounter struct {
 	windowMinutes int64
 	buckets       map[int64]int64 // unix minute -> messages
 	total         int64           // sum of buckets
-	pruned        int64           // newest minute for which old buckets were pruned
+	pruned        int64           // minute of the last prune
 	warned80      bool
 	warned100     bool
 }
@@ -120,10 +120,12 @@ func (u *upstreamCounter) add(minute, n int64) {
 	u.total += n
 }
 
-// advance drops buckets that left the window. It only walks the buckets when
-// the current minute moved on, so the per-message cost stays O(1).
+// advance drops buckets that left the window as of the current clock reading.
+// It only walks the buckets when the minute differs from the last call, so the
+// per-message cost stays O(1); a clock that moves backwards is handled too,
+// because the cutoff always comes from the current minute.
 func (u *upstreamCounter) advance(nowMin int64) {
-	if nowMin <= u.pruned {
+	if nowMin == u.pruned {
 		return
 	}
 	cutoff := nowMin - u.windowMinutes

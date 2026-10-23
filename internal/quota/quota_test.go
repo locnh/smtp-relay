@@ -603,3 +603,116 @@ func TestRecordDuringSlowWriteStaysDirty(t *testing.T) {
 	m2 := e.manager(t)
 	assert.EqualValues(t, 2, used(t, m2, "ses"))
 }
+
+func windowSum(u *upstreamCounter, nowMin int64) int64 {
+	var sum int64
+	for minute, n := range u.buckets {
+		if minute > nowMin-u.windowMinutes {
+			sum += n
+		}
+	}
+	return sum
+}
+
+func (c *fakeClock) Set(t time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = t
+}
+
+func TestClockMovingBackAndForthMatchesDirectSum(t *testing.T) {
+	e := newEnv(t, UpstreamQuota{Name: "ses", Limit: 100, Window: 10 * time.Minute})
+	m := e.manager(t)
+	base := e.clock.Now()
+
+	steps := []struct {
+		min    int
+		record int
+	}{{0, 2}, {5, 1}, {9, 0}, {12, 0}, {3, 0}, {15, 1}, {8, 0}, {20, 0}, {14, 2}, {30, 0}, {1, 0}, {16, 1}, {25, 0}}
+	for _, st := range steps {
+		e.clock.Set(base.Add(time.Duration(st.min) * time.Minute))
+		recordN(m, "ses", st.record)
+		u := m.byName["ses"]
+		got := used(t, m, "ses")
+		assert.Equal(t, windowSum(u, m.nowMinute()), got, "minute %d", st.min)
+		assert.Equal(t, sumBuckets(u), got, "total == sum(buckets) at minute %d", st.min)
+	}
+}
+
+func TestBackwardClockPrunesLikeDirectSum(t *testing.T) {
+	// A bucket recorded at minute 85 after the clock reached 100 is outside
+	// the window (cutoff 85) at minute 95.
+	e := newEnv(t, UpstreamQuota{Name: "ses", Limit: 100, Window: 10 * time.Minute})
+	m := e.manager(t)
+	base := e.clock.Now()
+	e.clock.Set(base.Add(100 * time.Minute))
+	_ = m.Statuses()
+	e.clock.Set(base.Add(85 * time.Minute))
+	m.Record("ses")
+	e.clock.Set(base.Add(95 * time.Minute))
+	assert.EqualValues(t, 0, used(t, m, "ses"))
+}
+
+func TestLongStateFileNameDoesNotHang(t *testing.T) {
+	e := newEnv(t, ses(100))
+	e.opts.StateFile = filepath.Join(t.TempDir(), strings.Repeat("a", 230)+".json")
+	if err := os.WriteFile(e.opts.StateFile, []byte("not json{"), 0o600); err != nil {
+		t.Skipf("filesystem rejects long names: %v", err)
+	}
+	type result struct {
+		m   *Manager
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() { m, err := New(e.opts); ch <- result{m, err} }()
+	select {
+	case r := <-ch:
+		require.NoError(t, r.err)
+		assert.EqualValues(t, 0, used(t, r.m, "ses"))
+		assert.Contains(t, e.logs.String(), "cannot rename corrupt quota state file")
+	case <-time.After(10 * time.Second):
+		t.Fatal("New hung on a state file whose .corrupt name is too long")
+	}
+}
+
+func readLimitedFor(t *testing.T, size int64) []byte {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "big")
+	f, err := os.Create(p)
+	require.NoError(t, err)
+	require.NoError(t, f.Truncate(size))
+	require.NoError(t, f.Close())
+	data, err := readLimited(p)
+	require.NoError(t, err)
+	return data
+}
+
+func TestStateReadIsBounded(t *testing.T) {
+	assert.Len(t, readLimitedFor(t, maxStateSize+10), maxStateSize+1, "read stops one byte past the limit")
+	assert.Len(t, readLimitedFor(t, maxStateSize), maxStateSize)
+
+	e := newEnv(t, ses(100))
+	require.NoError(t, os.MkdirAll(filepath.Dir(e.file), 0o700))
+	const doc = `{"version":1,"upstreams":{}}`
+	pad := append([]byte(doc), bytes.Repeat([]byte(" "), maxStateSize+1-len(doc))...)
+	require.NoError(t, os.WriteFile(e.file, pad, 0o600))
+	m := e.manager(t)
+	assert.EqualValues(t, 0, used(t, m, "ses"))
+	assert.Contains(t, e.logs.String(), "too large")
+	moved, _ := filepath.Glob(e.file + ".corrupt-*")
+	assert.Len(t, moved, 1)
+}
+
+func TestStaleTempCleanupWithSpecialCharsInPath(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "dir[1]*?")
+	require.NoError(t, os.MkdirAll(root, 0o700))
+	e := newEnv(t, ses(100))
+	e.opts.StateFile = filepath.Join(root, "st[a]te*.json")
+	old := e.clock.Now().Add(-time.Hour)
+	p := e.opts.StateFile + ".tmp-1"
+	require.NoError(t, os.WriteFile(p, []byte("x"), 0o600))
+	require.NoError(t, os.Chtimes(p, old, old))
+	e.manager(t)
+	_, err := os.Stat(p)
+	assert.True(t, os.IsNotExist(err))
+}

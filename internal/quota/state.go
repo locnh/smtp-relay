@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -76,21 +77,20 @@ func writeFileAtomic(path string, data []byte) error {
 // younger than staleTempAge may belong to a live writer and are kept.
 func removeStaleTemps(path string, now time.Time) {
 	dir, base := filepath.Dir(path), filepath.Base(path)
-	for _, kind := range []string{".tmp-", ".probe-"} {
-		matches, err := filepath.Glob(filepath.Join(dir, escapeGlob(base)+kind+"*"))
-		if err != nil {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, base+".tmp-") && !strings.HasPrefix(name, base+".probe-") {
 			continue
 		}
-		for _, p := range matches {
-			if fi, err := os.Lstat(p); err == nil && fi.Mode().IsRegular() && now.Sub(fi.ModTime()) > staleTempAge {
-				_ = os.Remove(p)
-			}
+		p := filepath.Join(dir, name)
+		if fi, err := os.Lstat(p); err == nil && fi.Mode().IsRegular() && now.Sub(fi.ModTime()) > staleTempAge {
+			_ = os.Remove(p)
 		}
 	}
-}
-
-func escapeGlob(s string) string {
-	return strings.NewReplacer(`\`, `\\`, "*", `\*`, "?", `\?`, "[", `\[`).Replace(s)
 }
 
 // checkWritable creates the state directory if needed, removes stale temp files
@@ -178,11 +178,15 @@ func (m *Manager) load() {
 		err = fmt.Errorf("state file too large (%d bytes)", fi.Size())
 	} else {
 		var data []byte
-		if data, err = os.ReadFile(m.stateFile); err != nil {
+		if data, err = readLimited(m.stateFile); err != nil {
 			m.log.Warn().Err(err).Str("file", m.stateFile).Msg("cannot read quota state file, starting with empty counters")
 			return
 		}
-		loaded, err = parseState(data)
+		if len(data) > maxStateSize {
+			err = fmt.Errorf("state file too large (more than %d bytes)", maxStateSize)
+		} else {
+			loaded, err = parseState(data)
+		}
 	}
 	if err != nil {
 		dst := m.setAsideCorrupt()
@@ -207,14 +211,29 @@ func (m *Manager) load() {
 	}
 }
 
+// readLimited reads at most maxStateSize+1 bytes, so a file that grew after
+// the size check is never read in full.
+func readLimited(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(io.LimitReader(f, maxStateSize+1))
+}
+
+const maxCorruptNameTries = 100
+
 // setAsideCorrupt renames the state file to <file>.corrupt-<unix nanoseconds>,
 // adding a counter if that name is taken, so earlier evidence is never
-// overwritten. It returns the new name, or "" if the rename failed.
+// overwritten. Probing stops at the first name that is free or cannot be
+// examined; os.Rename then decides. It returns the new name, or "" if the
+// rename failed (the caller carries on with empty counters either way).
 func (m *Manager) setAsideCorrupt() string {
 	base := fmt.Sprintf("%s.corrupt-%d", m.stateFile, m.now().UnixNano())
 	dst := base
-	for i := 1; ; i++ {
-		if _, err := os.Lstat(dst); errors.Is(err, os.ErrNotExist) {
+	for i := 1; i <= maxCorruptNameTries; i++ {
+		if _, err := os.Lstat(dst); err != nil {
 			break
 		}
 		dst = fmt.Sprintf("%s-%d", base, i)
