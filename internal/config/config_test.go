@@ -845,3 +845,192 @@ func TestUnknownKeyRepeatedOnOneLine(t *testing.T) {
 		})
 	}
 }
+
+func TestValidationNeverEchoesEnvValuesViaAliasesAndMerges(t *testing.T) {
+	const secret = "S3cr3t-Value-XYZ"
+	tests := []struct{ name, secretValue, yaml, wantPath string }{
+		{"tls alias in listen and upstream", secret, `
+server:
+  listen:
+    - {address: ':25', tls: &a '${S}'}
+    - {address: ':26', tls: *a}
+upstreams:
+  - {name: a, host: h, tls: *a}
+`, "upstreams[0].tls:"},
+		{"tls alias between upstreams", secret, `
+upstreams:
+  - {name: a, host: h, tls: &t ${S}}
+  - {name: b, host: h, tls: *t}
+`, "upstreams[1].tls:"},
+		{"ca_file via alias", secret, `
+upstreams:
+  - {name: a, host: h, tls_options: {ca_file: &ca '${S}'}}
+  - {name: b, host: h, tls_options: {ca_file: *ca}}
+`, "upstreams[1].tls_options.ca_file:"},
+		{"ca_file via merge key", secret, `
+upstreams:
+  - {name: a, host: h, tls_options: &opts {ca_file: '${S}'}}
+  - {name: b, host: h, tls_options: {<<: *opts}}
+`, "upstreams[1].tls_options.ca_file:"},
+		{"listen address via alias", secret, `
+server:
+  listen:
+    - {address: &ad '${S}'}
+    - {address: *ad}
+upstreams: [{name: a, host: h}]
+`, "server.listen[1].address:"},
+		{"allowed network via alias", secret, `
+access:
+  allowed_networks: [&n '${S}', *n]
+upstreams: [{name: a, host: h}]
+`, "access.allowed_networks[1]:"},
+		{"allowed network host bits via alias", "10.1.2.3/8", `
+access:
+  allowed_networks: [&n '${S}', *n]
+upstreams: [{name: a, host: h}]
+`, "access.allowed_networks[1]:"},
+		{"duration via alias (too small)", "500ms", `
+upstreams:
+  - {name: a, host: h, timeouts: {connect: &d '${S}'}}
+  - {name: b, host: h, timeouts: {connect: *d}}
+`, "upstreams[1].timeouts.connect:"},
+		{"whole upstream via merge key", secret, `
+upstreams:
+  - &base {name: a, host: h, tls: '${S}'}
+  - {<<: *base, name: b}
+`, "upstreams[1].tls:"},
+		{"merge from a sequence of anchors", secret, `
+upstreams:
+  - &u1 {name: a, host: h}
+  - &u2 {name: b, host: h, tls: '${S}'}
+  - {<<: [*u1, *u2], name: c}
+`, "upstreams[2].tls:"},
+		{"alias to a mapping holding the secret", secret, `
+upstreams:
+  - {name: a, host: h, tls_options: &o {ca_file: '${S}'}}
+  - {name: b, host: h, tls_options: *o}
+`, "upstreams[1].tls_options.ca_file:"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("S", tt.secretValue)
+			_, err := load(t, tt.yaml)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantPath, "the aliased location must be reported")
+			for _, bad := range []string{secret, "S3c", "10.1.2.3", "500ms"} {
+				assert.NotContains(t, err.Error(), bad)
+			}
+		})
+	}
+
+	t.Run("warning through alias", func(t *testing.T) {
+		t.Setenv("S", "0.0.0.0/0")
+		cfg := mustLoad(t, "access: {allowed_networks: [&n '${S}', *n]}\n"+minimalUpstream)
+		require.NotEmpty(t, cfg.Warnings())
+		for _, w := range cfg.Warnings() {
+			assert.NotContains(t, w, "0.0.0.0")
+		}
+	})
+}
+
+func TestAliasedLiteralValuesStayHelpful(t *testing.T) {
+	_, err := load(t, `
+upstreams:
+  - {name: a, host: h, tls: &t ssl}
+  - {name: b, host: h, tls: *t}
+`)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `upstreams[0].tls: must be starttls, tls or none, got "ssl"`)
+	assert.Contains(t, err.Error(), `upstreams[1].tls: must be starttls, tls or none, got "ssl"`)
+}
+
+func TestMergeKeysCountAsPresent(t *testing.T) {
+	t.Run("explicit zero timeout via merge is rejected", func(t *testing.T) {
+		_, err := load(t, `
+upstreams:
+  - {name: a, host: h, timeouts: &d {connect: 0s}}
+  - {name: b, host: h, timeouts: {<<: *d}}
+`)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "upstreams[1].timeouts.connect: must be at least 1s")
+	})
+
+	t.Run("explicit zero upstream port via merge is rejected", func(t *testing.T) {
+		_, err := load(t, `
+upstreams:
+  - &b {name: a, host: h, port: 0}
+  - {<<: *b, name: b}
+`)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "upstreams[1].port: must be between")
+	})
+
+	t.Run("password via merge plus password_file is both set", func(t *testing.T) {
+		pw := writeFile(t, t.TempDir(), "pw", "x")
+		_, err := load(t, fmt.Sprintf(`
+upstreams:
+  - {name: a, host: h, auth: &auth {username: u, password: p}}
+  - name: b
+    host: h
+    auth:
+      <<: *auth
+      password_file: %s
+`, pw))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "upstreams[1].auth.password: set either")
+	})
+
+	t.Run("merged password alone is accepted", func(t *testing.T) {
+		cfg := mustLoad(t, `
+upstreams:
+  - {name: a, host: h, auth: &auth {username: u, password: p}}
+  - {name: b, host: h, auth: {<<: *auth}}
+`)
+		assert.Equal(t, "p", cfg.Upstreams[1].Auth.Password.Reveal())
+	})
+
+	t.Run("local key overrides merged key", func(t *testing.T) {
+		cfg := mustLoad(t, `
+upstreams:
+  - {name: a, host: h, timeouts: &d {connect: 10s, command: 20s}}
+  - {name: b, host: h, timeouts: {<<: *d, connect: 5s}}
+`)
+		assert.Equal(t, 5*time.Second, cfg.Upstreams[1].Timeouts.Connect)
+		assert.Equal(t, 20*time.Second, cfg.Upstreams[1].Timeouts.Command)
+	})
+}
+
+func TestAliasBombIsBounded(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("access:\n  allowed_senders:\n  - &a0 [x, x, x, x, x, x, x, x, x, x]\n")
+	for i := 1; i < 12; i++ {
+		fmt.Fprintf(&b, "  - &a%d [", i)
+		for j := 0; j < 10; j++ {
+			if j > 0 {
+				b.WriteString(", ")
+			}
+			fmt.Fprintf(&b, "*a%d", i-1)
+		}
+		b.WriteString("]\n")
+	}
+	b.WriteString("upstreams: [{name: a, host: h}]\n")
+
+	start := time.Now()
+	_, err := load(t, b.String())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "alias")
+	assert.Less(t, time.Since(start), 5*time.Second)
+}
+
+func TestMergeBombIsBounded(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("upstreams:\n  - &m0 {name: a, host: h}\n")
+	for i := 1; i < 40; i++ {
+		fmt.Fprintf(&b, "  - &m%d {<<: [*m%d, *m%d], name: n%d}\n", i, i-1, i-1, i)
+	}
+
+	start := time.Now()
+	_, err := load(t, b.String())
+	require.Error(t, err)
+	assert.Less(t, time.Since(start), 5*time.Second)
+}

@@ -26,7 +26,7 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
 
-	data, doc, expanded, err := expandEnv(raw)
+	data, info, err := expandEnv(raw)
 	if err != nil {
 		return nil, err
 	}
@@ -36,12 +36,7 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 
-	present := map[string]bool{}
-	walk(doc, "", func(_ *yaml.Node, path string, key bool) {
-		if key {
-			present[path] = true
-		}
-	})
+	present, expanded := info.present, info.expanded
 	if err := cfg.applyDefaults(present); err != nil {
 		return nil, &ValidationError{Errors: []string{"server.hostname: cannot determine system hostname: " + err.Error()}}
 	}
@@ -57,10 +52,10 @@ func Load(path string) (*Config, error) {
 // otherwise end the mapping). Real values are then written into the parsed
 // tree, so a secret containing YAML metacharacters can never alter the
 // document structure, and expanded values are never expanded again. Unset
-// variables are reported by name, never by value. The returned set holds the
-// key paths whose value contained a substitution, so validation can avoid
-// echoing them.
-func expandEnv(raw []byte) ([]byte, *yaml.Node, map[string]bool, error) {
+// variables are reported by name, never by value. The returned docInfo holds
+// the key paths whose value contained a substitution, so validation can avoid
+// echoing them, and the key paths present in the file.
+func expandEnv(raw []byte) ([]byte, *docInfo, error) {
 	prefix := "__SMTPRELAY_ENV"
 	for bytes.Contains(raw, []byte(prefix)) {
 		prefix += "X"
@@ -74,14 +69,14 @@ func expandEnv(raw []byte) ([]byte, *yaml.Node, map[string]bool, error) {
 
 	var doc yaml.Node
 	if err := yaml.Unmarshal(masked, &doc); err != nil {
-		return nil, nil, nil, fmt.Errorf("parse config: %w", err)
+		return nil, nil, fmt.Errorf("parse config: %w", err)
 	}
 	if doc.Kind == 0 {
-		return raw, &doc, nil, nil
+		return raw, &docInfo{present: map[string]bool{}, expanded: map[string]bool{}}, nil
 	}
 
 	var errs []string
-	expanded := map[string]bool{}
+	envNodes := map[*yaml.Node]bool{}
 	walk(&doc, "", func(n *yaml.Node, path string, key bool) {
 		if n.Kind != yaml.ScalarNode || n.Tag != "!!str" || !sentinel.MatchString(n.Value) {
 			return
@@ -93,7 +88,7 @@ func expandEnv(raw []byte) ([]byte, *yaml.Node, map[string]bool, error) {
 			return
 		}
 		whole := sentinel.FindString(n.Value) == n.Value
-		expanded[path] = true
+		envNodes[n] = true
 		n.Value = sentinel.ReplaceAllStringFunc(n.Value, func(s string) string {
 			name := names[sentinelIndex(sentinel, s)]
 			v, ok := os.LookupEnv(name)
@@ -111,14 +106,147 @@ func expandEnv(raw []byte) ([]byte, *yaml.Node, map[string]bool, error) {
 		}
 	})
 	if len(errs) > 0 {
-		return nil, nil, nil, &ValidationError{Errors: errs}
+		return nil, nil, &ValidationError{Errors: errs}
+	}
+
+	info, err := analyze(&doc, envNodes)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	out, err := yaml.Marshal(&doc)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("re-encode config: %w", err)
+		return nil, nil, fmt.Errorf("re-encode config: %w", err)
 	}
-	return out, &doc, expanded, nil
+	return out, info, nil
+}
+
+// docInfo describes the document as the decoder will see it, aliases and merge
+// keys resolved.
+type docInfo struct {
+	// present holds every key path that is defined, directly or via a merge key.
+	present map[string]bool
+	// expanded holds every path at which an env-substituted scalar is reachable.
+	// The same scalar node can sit at several paths through aliases, so this is
+	// computed from node identity, not from where the substitution was made.
+	expanded map[string]bool
+}
+
+const (
+	maxAnalyzeVisits = 100000
+	maxAnalyzeDepth  = 200
+)
+
+var errTooManyAliases = errors.New("parse config: too many YAML aliases or merge keys (expansion limit exceeded)")
+
+type analyzer struct {
+	envNodes map[*yaml.Node]bool
+	info     *docInfo
+	visits   int
+	err      error
+}
+
+// analyze walks the tree the way the decoder resolves it: alias nodes are
+// followed and "<<" merge keys contribute their keys to the merging mapping
+// (a locally defined key wins over a merged one). The walk is bounded so an
+// alias bomb or a cyclic alias fails fast instead of expanding.
+func analyze(doc *yaml.Node, envNodes map[*yaml.Node]bool) (*docInfo, error) {
+	a := &analyzer{
+		envNodes: envNodes,
+		info:     &docInfo{present: map[string]bool{}, expanded: map[string]bool{}},
+	}
+	a.visit(doc, "", 0)
+	if a.err != nil {
+		return nil, a.err
+	}
+	return a.info, nil
+}
+
+func (a *analyzer) tick(depth int) bool {
+	a.visits++
+	if a.visits > maxAnalyzeVisits || depth > maxAnalyzeDepth {
+		a.err = errTooManyAliases
+	}
+	return a.err == nil
+}
+
+func resolveAlias(n *yaml.Node) *yaml.Node {
+	for i := 0; n.Kind == yaml.AliasNode && n.Alias != nil && i < maxAnalyzeDepth; i++ {
+		n = n.Alias
+	}
+	return n
+}
+
+func (a *analyzer) visit(n *yaml.Node, path string, depth int) {
+	if !a.tick(depth) {
+		return
+	}
+	n = resolveAlias(n)
+	switch n.Kind {
+	case yaml.DocumentNode:
+		for _, c := range n.Content {
+			a.visit(c, path, depth+1)
+		}
+	case yaml.MappingNode:
+		for _, p := range a.pairs(n, depth+1) {
+			cp := p.key.Value
+			if path != "" {
+				cp = path + "." + p.key.Value
+			}
+			a.info.present[cp] = true
+			a.visit(p.val, cp, depth+1)
+		}
+	case yaml.SequenceNode:
+		for i, c := range n.Content {
+			a.visit(c, fmt.Sprintf("%s[%d]", path, i), depth+1)
+		}
+	case yaml.ScalarNode:
+		if a.envNodes[n] {
+			a.info.expanded[path] = true
+		}
+	}
+}
+
+type pair struct{ key, val *yaml.Node }
+
+// pairs returns the effective key/value pairs of a mapping: its own keys
+// first, then keys from "<<" merges in order, skipping names already defined.
+func (a *analyzer) pairs(m *yaml.Node, depth int) []pair {
+	if !a.tick(depth) {
+		return nil
+	}
+	m = resolveAlias(m)
+	if m.Kind != yaml.MappingNode {
+		return nil
+	}
+	var out []pair
+	var merges []*yaml.Node
+	seen := map[string]bool{}
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		k, v := resolveAlias(m.Content[i]), m.Content[i+1]
+		if k.Kind == yaml.ScalarNode && k.ShortTag() == "!!merge" {
+			merges = append(merges, v)
+			continue
+		}
+		out = append(out, pair{k, v})
+		seen[k.Value] = true
+	}
+	for _, mv := range merges {
+		mv = resolveAlias(mv)
+		sources := []*yaml.Node{mv}
+		if mv.Kind == yaml.SequenceNode {
+			sources = mv.Content
+		}
+		for _, src := range sources {
+			for _, p := range a.pairs(src, depth+1) {
+				if !seen[p.key.Value] {
+					seen[p.key.Value] = true
+					out = append(out, p)
+				}
+			}
+		}
+	}
+	return out
 }
 
 func sentinelIndex(re *regexp.Regexp, s string) int {
