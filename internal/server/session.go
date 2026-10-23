@@ -155,24 +155,37 @@ func (s *Session) Data(r io.Reader) error {
 	// and this goroutine reads from a pipe, so the timer closing the connection
 	// is the real bound there.
 	var backstop *time.Timer
-	var cut atomic.Bool
+	// readState arbitrates between the timer and the end of the read: whoever
+	// moves it from 0 first wins, so the timer never closes a connection whose
+	// read already completed.
+	var readState atomic.Int32
+	const (
+		readDone int32 = 1
+		readCut  int32 = 2
+	)
 	if d := srv.dataTimeout; d > 0 {
 		_ = s.conn.Conn().SetReadDeadline(start.Add(d))
 		backstop = time.AfterFunc(d+dataBackstopGrace, func() {
-			cut.Store(true)
-			s.closeConn()
+			if readState.CompareAndSwap(0, readCut) {
+				s.closeConn()
+			}
 		})
 	}
 	data, err := io.ReadAll(r)
 	// Only the reading phase is bounded; delivery has its own timeouts.
+	cut := false
 	if backstop != nil {
 		backstop.Stop()
+		cut = !readState.CompareAndSwap(0, readDone)
 	}
 	if err != nil {
-		if cut.Load() {
+		if cut {
 			s.log.Warn().Str("peer", s.peer).Msg("DATA phase timed out, connection closed")
 		}
 		return s.dataReadError(err, from)
+	}
+	if cut {
+		s.log.Warn().Str("peer", s.peer).Msg("data timeout raced with a completed read")
 	}
 	srv.events.MessageReceived(len(data))
 

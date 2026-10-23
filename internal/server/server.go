@@ -30,7 +30,7 @@ type Deliverer interface {
 // must be safe for concurrent use and must not block.
 type Events interface {
 	// MessageRejected is called for a mail refused before DATA completed:
-	// sender_denied, null_sender, size_exceeded or too_many_recipients.
+	// sender_denied, null_sender or size_exceeded.
 	MessageRejected(reason string)
 	ConnAccepted(listener string)
 	ConnClosed(listener string)
@@ -287,8 +287,13 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return errors.Join(all...)
 }
 
+// waitInflight waits, within one grace period, for the force-closed
+// connections to be released and then for running deliveries to finish.
 func (s *Server) waitInflight() {
 	deadline := time.Now().Add(s.drainGrace)
+	for s.gate.active.Load() > 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
 	for s.inflight.Load() > 0 {
 		if time.Now().After(deadline) {
 			s.log.Warn().Int64("leaked_deliveries", s.inflight.Load()).
