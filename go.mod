@@ -4,7 +4,7 @@ go 1.27.3
 
 require (
 	github.com/DeRuina/timberjack v1.4.9
-	github.com/emersion/go-smtp v0.25.0
+	github.com/emersion/go-smtp v0.25.1
 	github.com/google/uuid v1.6.0
 	github.com/prometheus/client_golang v1.25.0
 	github.com/rs/zerolog v1.35.1
