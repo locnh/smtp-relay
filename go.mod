@@ -3,7 +3,7 @@ module github.com/locnh/smtp-relay
 go 1.27.3
 
 require (
-	github.com/DeRuina/timberjack v1.4.9
+	github.com/DeRuina/timberjack v1.4.10
 	github.com/emersion/go-smtp v0.25.0
 	github.com/google/uuid v1.6.0
 	github.com/prometheus/client_golang v1.25.0
